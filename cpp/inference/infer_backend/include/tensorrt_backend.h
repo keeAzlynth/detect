@@ -71,4 +71,6 @@ class TensorRTBackend : public InferenceBackend {
     std::vector<int> input_dims_;
     size_t           input_byte_size_;
     std::string      input_tensor_name_;
+    std::vector<void*> sync_buffers_;    // 预分配同步推理 buffer
+    std::vector<void*> async_buffers_;   // 预分配异步推理 buffer
 };

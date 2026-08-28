@@ -48,6 +48,9 @@ class YoloDetectModel : public BaseModel {
     unique_ptr_pinned_cuda<float> h_infer_out_pinned_;
 
     int output_candidates_;
+    float letterbox_r_ = 1.0f;    // letterbox 缩放比（预计算）
+    float letterbox_pad_w_ = 0.0f; // letterbox 水平灰边（预计算）
+    float letterbox_pad_h_ = 0.0f; // letterbox 垂直灰边（预计算）
 
   public:
     // 常量

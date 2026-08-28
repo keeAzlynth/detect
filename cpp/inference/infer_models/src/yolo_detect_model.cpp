@@ -88,6 +88,15 @@ void YoloDetectModel::init(std::map<std::string, std::string> model_path,
         }
     }
 
+    // 预计算 letterbox 常量，避免每帧重复计算
+    {
+        float r_w = static_cast<float>(input_w_) / raw_img_w_;
+        float r_h = static_cast<float>(input_h_) / raw_img_h_;
+        letterbox_r_ = std::min(r_w, r_h);
+        letterbox_pad_h_ = (input_h_ - letterbox_r_ * raw_img_h_) / 2.0f;
+        letterbox_pad_w_ = (input_w_ - letterbox_r_ * raw_img_w_) / 2.0f;
+    }
+
     APP_INFO("YOLO model initialized successfully");
 }
 

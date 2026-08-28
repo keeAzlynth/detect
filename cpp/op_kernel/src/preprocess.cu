@@ -82,9 +82,9 @@ __global__ void process(const uchar * srcData, float * tgtData, const int h, con
     int idx3 = idx * 3;
 
     if (ix < w && iy < h) {
-        tgtData[idx]             = (float) srcData[idx3 + 2] / 255.0;  // BGR→RGB: R=src[2]
-        tgtData[idx + h * w]     = (float) srcData[idx3 + 1] / 255.0;  // G=src[1]
-        tgtData[idx + h * w * 2] = (float) srcData[idx3] / 255.0;      // B=src[0]
+        tgtData[idx]             = (float) srcData[idx3 + 2] * 0.003921568627f;  // BGR→RGB: R=src[2], * (1/255)
+        tgtData[idx + h * w]     = (float) srcData[idx3 + 1] * 0.003921568627f;  // G=src[1]
+        tgtData[idx + h * w * 2] = (float) srcData[idx3] * 0.003921568627f;      // B=src[0]
     }
 }
 
@@ -214,7 +214,7 @@ __global__ void resize_mat2tensor_norm_kernel(uchar * src,
 
         // 归一化后写入 CHW 布局：out[c * H * W + y * W + x]
         int out_idx  = c * resized_h * resized_w + dst_idy * resized_w + dst_idx;
-        dst[out_idx] = (val / 255.0f - mean[c]) / std[c];
+        dst[out_idx] = (val * 0.003921568627f - mean[c]) / std[c];
     }
 }
 

@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-[[nodiscard]] [[nodiscard]] cv::Mat drawOneFrame(FrameInputContext &            frame_input_context,
+[[nodiscard]] cv::Mat drawOneFrame(FrameInputContext &            frame_input_context,
                      InferOutputContext &           infer_output_context,
                      const ConfigManager &          config_manager,
                      DrawingManager &               drawing_manager,

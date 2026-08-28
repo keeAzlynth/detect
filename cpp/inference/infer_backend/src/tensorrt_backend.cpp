@@ -276,6 +276,10 @@ void TensorRTBackend::setupInputOutputDims() {
     // 设置输入维度（动态形状）
 #if NV_TENSORRT_MAJOR < 10
     context_->setBindingDimensions(0, input_dims);
+
+    // 预分配推理 buffer，避免每帧堆分配
+    sync_buffers_.resize(output_tensor_.size() + 1);
+    async_buffers_.resize(output_tensor_.size() + 1);
 #else
     context_->setInputShape(input_tensor_name_.c_str(), input_dims);
 #endif
@@ -295,12 +299,12 @@ bool TensorRTBackend::runInference(void * input_data, std::vector<void *> output
                   output_data.size());
         return false;
     }
-    std::vector<void *> buffers(output_data.size() + 1);
-    buffers[0] = input_data;
+    // 使用预分配 buffer，避免每帧堆分配
+    sync_buffers_[0] = input_data;
     for (size_t i = 0; i < output_data.size(); i++) {
-        buffers[i + 1] = output_data[i];
+        sync_buffers_[i + 1] = output_data[i];
     }
-    bool status = context_->executeV2(buffers.data());
+    bool status = context_->executeV2(sync_buffers_.data());
     if (!status) {
         APP_ERROR("TensorRT inference failed");
         return false;
@@ -334,13 +338,12 @@ bool TensorRTBackend::runInferenceAsync(void *              input_data,
     }
     bool status = context_->enqueueV3(stream);
 #else
-    // TRT 8.x: Uses buffer array with enqueueV2
-    std::vector<void *> buffers(output_data.size() + 1);
-    buffers[0] = input_data;
+    // TRT 8.x: Uses buffer array with enqueueV2（预分配）
+    async_buffers_[0] = input_data;
     for (size_t i = 0; i < output_data.size(); i++) {
-        buffers[i + 1] = output_data[i];
+        async_buffers_[i + 1] = output_data[i];
     }
-    bool status = context_->enqueueV2(buffers.data(), stream, nullptr);
+    bool status = context_->enqueueV2(async_buffers_.data(), stream, nullptr);
 #endif
     if (!status) {
         APP_ERROR("TensorRT async inference failed");

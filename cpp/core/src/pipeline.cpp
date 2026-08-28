@@ -60,6 +60,10 @@ struct PhaseTimer {
         fprintf(stderr, "[TIMER] %s: %.2f ms\n", name, us / 1000.0);
     }
 };
+// 禁用版本：零开销
+struct PhaseTimerDisabled {
+    PhaseTimerDisabled(const char*) {}
+};
 
 void Pipeline::init() {}
 
@@ -86,8 +90,8 @@ void Pipeline::process(FrameInputContext &  frame_input_context,
         }
         // 缓存深度结果
         has_cached_depth_ = true;
-        cached_depth_ = infer_output_context.result_depth.clone();
-        cached_depth_vis_ = infer_output_context.depth_vis.clone();
+        cv::Mat tmp_depth; std::swap(tmp_depth, infer_output_context.result_depth); std::swap(cached_depth_, tmp_depth);
+        cv::Mat tmp_vis; std::swap(tmp_vis, infer_output_context.depth_vis); std::swap(cached_depth_vis_, tmp_vis);
     } else if (has_cached_depth_) {
         // 使用缓存的深度结果
         infer_output_context.result_depth = cached_depth_;
@@ -133,8 +137,8 @@ void Pipeline::processOverlap(FrameInputContext &  frame_input_context,
         }
         // 缓存深度结果
         has_cached_depth_ = true;
-        cached_depth_ = infer_output_context.result_depth.clone();
-        cached_depth_vis_ = infer_output_context.depth_vis.clone();
+        cv::Mat tmp_depth; std::swap(tmp_depth, infer_output_context.result_depth); std::swap(cached_depth_, tmp_depth);
+        cv::Mat tmp_vis; std::swap(tmp_vis, infer_output_context.depth_vis); std::swap(cached_depth_vis_, tmp_vis);
     } else if (has_cached_depth_) {
         // 使用缓存的深度结果
         infer_output_context.result_depth = cached_depth_;

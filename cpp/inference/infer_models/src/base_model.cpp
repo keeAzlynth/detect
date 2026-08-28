@@ -126,11 +126,16 @@ bool BaseModel::runInferenceAsync(FrameInputContext & frame_input_context) {
     } else if (backend_->getBackendType() == BackendType::TensorRT) {
         // TensorRT 异步路径：预处理→推理→后处理全在 GPU Stream 上排队，CPU 不等待
         cudaPreProcess(frame_input_context);
-        std::vector<void *> output_buffers;
-        output_buffers.reserve(d_infer_io_.size() - 1);
-        std::transform(d_infer_io_.begin() + 1, d_infer_io_.end(),
-                       std::back_inserter(output_buffers), [](auto & ptr) { return ptr.get(); });
-        backend_->runInferenceAsync(d_infer_io_[0].get(), output_buffers, stream_);
+        // 预分配 output_buffers（静态，跨帧复用）
+        static std::vector<void *> output_buffers_async;
+        if (output_buffers_async.capacity() < d_infer_io_.size() - 1) {
+            output_buffers_async.reserve(d_infer_io_.size() - 1);
+        }
+        output_buffers_async.clear();
+        for (auto it = d_infer_io_.begin() + 1; it != d_infer_io_.end(); ++it) {
+            output_buffers_async.push_back(it->get());
+        }
+        backend_->runInferenceAsync(d_infer_io_[0].get(), output_buffers_async, stream_);
         // 异步后处理
         cudaPostProcess(frame_input_context);
         return true;
@@ -145,8 +150,12 @@ bool BaseModel::runInference(FrameInputContext &  frame_input_context,
         APP_ERROR("Model not initialized");
         return false;
     }
-    std::vector<void *> output_buffers;
-    output_buffers.reserve(getNumOutputs());
+    // 预分配 output_buffers（静态，跨帧复用）
+    static std::vector<void *> output_buffers;
+    if (output_buffers.capacity() < static_cast<size_t>(getNumOutputs())) {
+        output_buffers.reserve(getNumOutputs());
+    }
+    output_buffers.clear();
     if (backend_->getBackendType() == BackendType::OnnxRuntime) {
         std::vector<float> onnx_input_tensor = cvMatPreProcess(frame_input_context);
         std::transform(h_infer_out_.begin(), h_infer_out_.end(), std::back_inserter(output_buffers),
@@ -158,8 +167,9 @@ bool BaseModel::runInference(FrameInputContext &  frame_input_context,
         // TensorRT 同步路径：异步预处理 → 等待完成 → 同步推理 → 异步后处理 → 取结果
         cudaPreProcess(frame_input_context);
         synchronizeStream();  // 确保预处理数据就绪后再推理
-        std::transform(d_infer_io_.begin() + 1, d_infer_io_.end(),
-                       std::back_inserter(output_buffers), [](auto & ptr) { return ptr.get(); });
+        for (auto it = d_infer_io_.begin() + 1; it != d_infer_io_.end(); ++it) {
+            output_buffers.push_back(it->get());
+        }
         backend_->runInference(d_infer_io_[0].get(), output_buffers);
         // 异步后处理
         cudaPostProcess(frame_input_context);

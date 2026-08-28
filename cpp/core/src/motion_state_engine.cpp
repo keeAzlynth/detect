@@ -109,11 +109,14 @@ MotionStateInfoRecord MotionStateEngine::computeMotionState(int    track_id,
 }
 
 float MotionStateEngine::getObjectDepth(cv::Mat depth, const STrack & track, cv::Size image_size) {
-    if (!depth.empty()) {
-        cv::resize(depth, depth, image_size);
-    } else {
+    if (depth.empty()) {
         APP_WARN("depth_map is empty!");
         return 0.0f;
+    }
+    // 避免每帧 resize：depth 已经是目标分辨率（depth_model 输出为 raw_img_h x raw_img_w）
+    // 直接使用，仅在尺寸不匹配时 resize
+    if (depth.rows != image_size.height || depth.cols != image_size.width) {
+        cv::resize(depth, depth, image_size);
     }
 
     const std::vector<float> & tlwh        = track.tlwh_;
@@ -144,8 +147,29 @@ float MotionStateEngine::computeMeanDepth(cv::Mat                    depth,
         return 0.0f;
     }
 
-    // 存储当前目标收集到的有效深度点
-    std::vector<float> sampled_depths;
+    // 栈上小缓冲区（大多数场景 < 100 个采样点），避免堆分配
+    float sampled_stack[128];
+    float* sampled_depths_data = sampled_stack;
+    int sampled_count = 0;
+    int sampled_capacity = 128;
+    // 如果超出栈容量才用堆
+    std::vector<float> sampled_heap;
+    auto push_depth = [&](float v) {
+        if (sampled_count < sampled_capacity) {
+            sampled_depths_data[sampled_count++] = v;
+        } else {
+            if (sampled_heap.empty()) {
+                sampled_heap.assign(sampled_depths_data, sampled_depths_data + sampled_count);
+            }
+            sampled_heap.push_back(v);
+        }
+    };
+    auto get_depths = [&]() -> std::vector<float> {
+        if (sampled_heap.empty()) {
+            return std::vector<float>(sampled_depths_data, sampled_depths_data + sampled_count);
+        }
+        return sampled_heap;
+    };
 
     // 在目标框内均匀网格采样，统计有效深度值
     // 采样策略：缩进 20% 边界以避开边缘背景，按 grid_size × grid_size 在框内均匀采点
@@ -172,17 +196,18 @@ float MotionStateEngine::computeMeanDepth(cv::Mat                    depth,
             }
 
             if (depth_value > 0.01f) {
-                sampled_depths.push_back(depth_value);
+                push_depth(depth_value);
             }
         }
     }
 
-    if (sampled_depths.empty()) {
+    if (sampled_count == 0 && sampled_heap.empty()) {
         return 0.0f;
     }
 
     // 截断均值法：先排序，剔除两端 25% 异常值（前 25% 可能是前景遮挡，后 25% 可能是背景噪声）
     // 再对中间 50% 的数据取均值，得到该目标在当前帧的鲁棒深度估计
+    auto sampled_depths = get_depths();
     std::sort(sampled_depths.begin(), sampled_depths.end());
     int num_valid = sampled_depths.size();
     if (num_valid < 4) {

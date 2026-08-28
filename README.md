@@ -12,17 +12,22 @@ YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT FP16 引擎加速 + CUD
 - **双模型推理**：YOLOv8n 目标检测 + Lite-Mono-Tiny 单目深度估计，TensorRT 8.2 FP16 引擎
 - **纯 GPU 管线**：CUDA 预处理（letterbox/归一化）+ CUDA 后处理（NMS），`--use_fast_math`
 - **目标跟踪**：ByteTrack + 卡尔曼滤波，支持目标运动状态（趋近/远离/加减速）判断
-- **异步重叠**：`overlap: true` 时推理与主循环重叠执行，降低帧间等待
+- **异步重叠**：`overlap: true` 时读帧线程与主循环重叠；YOLO 与 Depth 通过各自 CUDA 流真并行（Depth 先发车，YOLO 等待/跟踪期间 Depth 持续计算）
+- **零分配稳态**：单 `Pipeline` 实例 + 2 槽位帧缓冲池循环复用，稳态无每帧 `cudaMalloc`/`cudaFree`；首帧预热在进入主循环前完成
 - **报警机制**：危险目标（距离变化）自动生成 AlertMessage，支持 TCP 上报
 - **多输入**：H.264 视频文件 / USB 摄像头（`/dev/video0`）两种输入
 - **性能模式脚本**：`perf.sh` 一键内核调优（MAXN + jetson_clocks + performance governor）
 
-### 实测性能（Jetson Nano, FP16, MAXN）
+### 实测性能（Jetson Nano, FP16, MAXN, 2026-08-28）
 
 | 场景 | 结果 |
 |---|---|
-| 视频文件 (1shu_east_0514.mp4, 30fps) | 约 6.3 fps（单帧管线 ~159ms） |
-| USB 摄像头 (性能模式) | 稳态约 6 fps |
+| 视频文件 (1shu_east_0514.mp4, 30fps) | **6.54 fps**（单帧推理 ~153ms；含绘图+JPEG 落盘的墙钟 ~162ms/帧），800 帧内波动 ±0.01 |
+| USB 摄像头 (性能模式) | 稳态约 6.5 fps |
+| 启动 | ~24s（单 Pipeline 实例，反序列化 2 个引擎）；首帧 TRT/cuDNN 自动调优已由预热吸收，主循环第一帧即稳态 |
+| 内存 | 单实例后运行内存约减半，4GB 板上无换页抖动 |
+
+> 2026-08-28 优化记录：此前版本 `main.cpp` 与 `AsyncPipeline` 各自隐式加载一份 Pipeline（4 次引擎反序列化、显存翻倍），在 4GB 板上会触发换页抖动导致阶段耗时 7~85ms 剧烈波动；深度缓存 swap 顺序错误导致运动状态判定每帧拿到空深度图。以上问题已修复（commit 469f09b）。
 
 ---
 
@@ -81,6 +86,7 @@ cmake --build . -- -j4  # 并行编译（老 cmake 需用 `--` 传 -j，或直�
 
 ```bash
 cmake -DENABLE_TIMER=OFF ..                 # 关闭逐阶段计时统计
+cmake -DPIPELINE_PHASE_TIMER=ON ..          # 开启 pipeline 内每阶段 [TIMER] 打印（默认关，零开销）
 cmake -DENABLE_JESTON_MEM_MANAGED=ON ..     # Jetson 统一内存（实验性）
 cmake -DTARGET_CUDA_ARCHS=53 ..             # 手动指定 CUDA 架构
 cmake -DCMAKE_BUILD_TYPE=Debug ..           # 调试构建
@@ -172,19 +178,31 @@ sudo nice -n -10 ./main 0 config.yaml
 |---|---|
 | `Failed to open video: 0` | 程序内置支持纯数字设备号走 `/dev/video0`；确认 USB 摄像头已插、`ls /dev/video*` 可见 |
 | `cmake: CMAKE_CUDA_COMPILER could not be found` | 本新版 CMakeLists 会自动找 nvcc；若仍失败，`sudo apt install nvidia-cuda-toolkit` 或用 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc` |
-| 启动慢（约20s） | 正常：启动需反序列化 2 个 TRT 引擎，之后进入稳态 FPS |
+| 启动慢（约20s+） | 正常：需反序列化 2 个 TRT 引擎（~24s）；首帧自动调优已由预热吸收，主循环首帧即稳态 |
 | `VIDEOIO ERROR: V4L2: property frame_count is not supported` | 正常：摄像头无帧总数属性，不影响运行 |
 | pip 装包 ProxyError | 板子走代理时用 `env -u http_proxy -u https_proxy ...` 绕开 |
 
 ---
 
-## 九、性能优化方向（TODO / 重构点）
+## 九、性能优化记录与方向
 
-- [ ] 引擎反序列化缓存到共享内存，跳过启动 20s 冷加载
-- [ ] 深度推理隔帧（`depth_interval`）与延迟渲染分离
-- [ ] 生产者-消费者线程池，读帧/推理/绘图流水线重排
-- [ ] 裁剪 onnxruntime 依赖（仅 TRT 后端运行时可不链接）
+已完成（2026-08-28，commit 469f09b）：
+
+- [x] 单 `Pipeline` 实例：`AsyncPipeline` 改持外部引用，消除双份引擎加载（启动/显存减半）
+- [x] 2 槽位帧缓冲池：稳态零 `cudaMalloc`/`cudaFree`（后者隐式同步全设备，是隐性停顿点）
+- [x] YOLO/Depth 双 CUDA 流真重叠：Depth 先异步发车，与 YOLO 等待/跟踪期并行
+- [x] 首帧预热：TRT/cuDNN 首帧 ~35s 自动调优移出主循环
+- [x] 深度缓存 swap 顺序修复：运动状态判定不再拿到空深度图
+- [x] `BaseModel` 输出指针表 static → 实例成员（消除多实例互踩隐患）
+- [x] letterbox 常量真正复用 + 乘倒数替代除法；`cv::Mat` 热路径传参改 `const &`
+- [x] `PhaseTimer` 编译期开关（`-DPIPELINE_PHASE_TIMER=ON` 可开，默认零开销）
+
+待做 / 候选方向：
+
+- [ ] 引擎反序列化加速（当前 `/dev/shm` 缓存只写不读，反序列化本身仍是启动 ~24s 的主体）
+- [ ] `depth_interval: 2` 评估：深度隔帧可到 ~8.7 fps，代价是深度更新率减半（需业务侧确认精度）
 - [ ] 报警上报 JSON 轻量化（剥离 JsonSender 或改共享内存）
+- [ ] INT8 量化评估（注意 Tegra X1 为 Maxwell 架构，无 DP4A，加速比预期有限，先实测再投入）
 
 ---
 

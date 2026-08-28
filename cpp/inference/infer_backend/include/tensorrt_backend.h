@@ -1,0 +1,74 @@
+#pragma once
+
+#include "inference_backend.h"
+#include "logger_manager.h"
+#include "memory.h"
+
+#include <cuda_runtime_api.h>
+#include <NvInfer.h>
+
+#include <string>
+#include <vector>
+
+// TensorRT 推理后端（GPU 加速）
+class TensorRTBackend : public InferenceBackend {
+  public:
+    TensorRTBackend(int gpu_id = 0);
+    ~TensorRTBackend() override;
+
+    // InferenceBackend 接口实现
+    bool loadModel(const std::string & model_path) override;
+    __attribute__((hot)) __attribute__((hot)) bool runInference(void * input_data, void * output_data) override;
+    __attribute__((hot)) __attribute__((hot)) bool runInference(void * input_data, std::vector<void *> output_data) override;
+    __attribute__((hot)) __attribute__((hot)) bool runInferenceAsync(void * input_data, void * output_data, cudaStream_t stream) override;
+    __attribute__((hot)) __attribute__((hot)) bool runInferenceAsync(void *              input_data,
+                           std::vector<void *> output_data,
+                           cudaStream_t        stream) override;
+
+    std::vector<int>     getInputDims() const override;
+    std::vector<int64_t> getOutputDims(int output_index = 0) const override;
+    size_t               getInputByteSize() const override;
+    size_t               getOutputByteSize(int output_index = 0) const override;
+
+    [[nodiscard]] BackendType getBackendType() const noexcept override { return BackendType::TensorRT; }
+
+    [[nodiscard]] std::string getBackendTypeName() const noexcept override { return "TensorRT"; }
+
+    bool isAvailable() const noexcept override;
+
+    // TensorRT 特有方法
+    [[nodiscard]] nvinfer1::IExecutionContext * getContext() const noexcept { return context_.get(); }
+
+    virtual size_t getOutputIndexFromName(const std::string & name) const override {
+
+        for (size_t i = 0; i < output_tensor_.size(); ++i) {
+            if (output_tensor_[i].name == name) {
+                return i + 1;
+            }
+        }
+        return static_cast<size_t>(-1);  // 返回 -1 表示未找到
+    }
+
+
+    // 引擎缓存到共享内存
+    std::string getShmPath(const std::string& engine_path) const;
+    bool saveEngineToShm(const std::string& engine_path);
+    bool loadEngineFromShm(const std::string& engine_path);
+
+  private:
+    __attribute__((hot)) __attribute__((hot)) bool loadEngine(const std::string & engine_path);
+    void setupInputOutputDims();
+
+  private:
+    int    gpu_id_;
+    Logger logger_;
+
+    // TensorRT 组件
+    TrtRuntimePtr    runtime_;
+    TrtEnginePtr     engine_;
+    TrtContextPtr    context_;
+    // 输入维度信息, Tensor 名称
+    std::vector<int> input_dims_;
+    size_t           input_byte_size_;
+    std::string      input_tensor_name_;
+};

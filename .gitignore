@@ -1,0 +1,67 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.dylib
+*.a
+
+# Binaries
+bin/main
+bin/server_test
+bin/JsonSenderTest
+bin/test_*
+bin/out_dir/
+bin/logs/
+bin/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.bak
+*.tmp
+*~
+
+# Tegrastats logs
+tegrastats_*.log
+
+# Benchmark results
+benchmark/test_*.txt
+benchmark/tegrastats_*.log
+benchmark/latest.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# Model files (large, should use git-lfs or download separately)
+model/*.onnx
+model/*.engine
+model/**/*.onnx
+model/**/*.engine
+model/**/*.onnx.data
+model/engine/
+
+# Data files (large videos)
+data/*.mp4
+data/*.avi
+data/*.mkv
+data/*.mov
+
+# Shared memory cache
+/dev/shm/trt_engine_*

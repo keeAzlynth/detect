@@ -50,20 +50,28 @@ Pipeline::Pipeline(std::string depth_model_path,
 }
 
 
+// 阶段计时开关：编译期门控，关闭时零开销。
+// 默认关闭（每帧 6 次 fprintf 到 stderr 会拖慢流水线并污染测量）。
+// 需要观察各阶段耗时时用 -DPIPELINE_PHASE_TIMER=1 重新编译。
+#ifndef PIPELINE_PHASE_TIMER
+#define PIPELINE_PHASE_TIMER 0
+#endif
+
+#if PIPELINE_PHASE_TIMER
 struct PhaseTimer {
     const char* name;
     std::chrono::steady_clock::time_point start;
-    PhaseTimer(const char* n) : name(n), start(std::chrono::steady_clock::now()) {}
+    explicit PhaseTimer(const char* n) : name(n), start(std::chrono::steady_clock::now()) {}
     ~PhaseTimer() {
-        auto end = std::chrono::steady_clock::now();
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        const auto end = std::chrono::steady_clock::now();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         fprintf(stderr, "[TIMER] %s: %.2f ms\n", name, us / 1000.0);
     }
 };
-// 禁用版本：零开销
-struct PhaseTimerDisabled {
-    PhaseTimerDisabled(const char*) {}
-};
+#define PIPELINE_PHASE_SCOPE(name) PhaseTimer phase_timer__(name)
+#else
+#define PIPELINE_PHASE_SCOPE(name)
+#endif
 
 void Pipeline::init() {}
 
@@ -72,98 +80,120 @@ void Pipeline::init() {}
 void Pipeline::process(FrameInputContext &  frame_input_context,
                        InferOutputContext & infer_output_context) {
     {
-        PhaseTimer t("YOLO_Detection");
+        PIPELINE_PHASE_SCOPE("YOLO_Detection");
         detector_.runInference(frame_input_context, infer_output_context);
     }
     {
-        PhaseTimer t("BYTETracker");
+        PIPELINE_PHASE_SCOPE("BYTETracker");
         updateTracker(infer_output_context);
     }
-    
+
     // 根据 depth_interval 决定是否执行深度推理
     depth_frame_counter_++;
-    if (depth_frame_counter_ >= depth_interval_) {
+    bool run_depth = (depth_frame_counter_ >= depth_interval_);
+    if (run_depth) {
         depth_frame_counter_ = 0;
         {
-            PhaseTimer t("Depth_Inference");
+            PIPELINE_PHASE_SCOPE("Depth_Inference");
             depth_model_.runInference(frame_input_context, infer_output_context);
         }
-        // 缓存深度结果
         has_cached_depth_ = true;
-        cv::Mat tmp_depth; std::swap(tmp_depth, infer_output_context.result_depth); std::swap(cached_depth_, tmp_depth);
-        cv::Mat tmp_vis; std::swap(tmp_vis, infer_output_context.depth_vis); std::swap(cached_depth_vis_, tmp_vis);
     } else if (has_cached_depth_) {
-        // 使用缓存的深度结果
+        // 使用缓存的深度结果（浅拷贝，零像素拷贝）
         infer_output_context.result_depth = cached_depth_;
-        infer_output_context.depth_vis = cached_depth_vis_;
+        infer_output_context.depth_vis    = cached_depth_vis_;
     }
-    
+
     {
-        PhaseTimer t("Motion_State");
+        PIPELINE_PHASE_SCOPE("Motion_State");
         updateMotionStates(frame_input_context, infer_output_context);
+    }
+
+    if (run_depth) {
+        // 运动状态计算完成后再缓存深度结果：swap 零拷贝。
+        // 注意不能在 updateMotionStates 之前 swap —— swap 会把
+        // infer_output_context.result_depth 清空，导致运动状态拿到空深度图。
+        cv::Mat tmp_depth;
+        std::swap(tmp_depth, infer_output_context.result_depth);
+        std::swap(cached_depth_, tmp_depth);
+        cv::Mat tmp_vis;
+        std::swap(tmp_vis, infer_output_context.depth_vis);
+        std::swap(cached_depth_vis_, tmp_vis);
     }
 }
 
-// CPU/GPU 重叠推理：YOLO 和 Depth 通过各自 CUDA Stream 异步执行，实现并行
-// 流程：同时启动 YOLO 和 Depth 异步推理 → YOLO 结果先返回（延迟更低）→ 先做跟踪
-//       → Depth 结果随后返回 → 运动状态判定
+// CPU/GPU 重叠推理：Depth 与 YOLO 通过各自 CUDA Stream 异步执行，实现并行。
+// 流程：先启动耗时更长的 Depth 异步推理 → 再启动 YOLO 异步推理 → 等待 YOLO 结果
+//       （此期间 Depth 在另一条流上继续计算）→ 跟踪 → 等待 Depth 结果 → 运动状态判定。
 // depth_interval: 每隔 depth_interval 帧执行一次深度推理，节省算力
 void Pipeline::processOverlap(FrameInputContext &  frame_input_context,
                               InferOutputContext & infer_output_context) {
+    // 根据 depth_interval 决定本帧是否执行深度推理
+    depth_frame_counter_++;
+    bool run_depth = (depth_frame_counter_ >= depth_interval_);
+    if (run_depth) {
+        depth_frame_counter_ = 0;
+        {
+            PIPELINE_PHASE_SCOPE("Depth_Inference_Async");
+            depth_model_.runInferenceAsync(frame_input_context);
+        }
+    }
     {
-        PhaseTimer t("YOLO_Detection_Async");
+        PIPELINE_PHASE_SCOPE("YOLO_Detection_Async");
         detector_.runInferenceAsync(frame_input_context);
     }
     {
-        PhaseTimer t("YOLO_GetResult");
+        PIPELINE_PHASE_SCOPE("YOLO_GetResult");
         detector_.getInferOutputResult(infer_output_context);
     }
     {
-        PhaseTimer t("BYTETracker");
+        PIPELINE_PHASE_SCOPE("BYTETracker");
         updateTracker(infer_output_context);
     }
-    
-    // 根据 depth_interval 决定是否执行深度推理
-    depth_frame_counter_++;
-    if (depth_frame_counter_ >= depth_interval_) {
-        depth_frame_counter_ = 0;
+
+    if (run_depth) {
         {
-            PhaseTimer t("Depth_Inference_Async");
-            depth_model_.runInferenceAsync(frame_input_context);
-        }
-        {
-            PhaseTimer t("Depth_GetResult");
+            PIPELINE_PHASE_SCOPE("Depth_GetResult");
             depth_model_.getInferOutputResult(infer_output_context);
         }
-        // 缓存深度结果
         has_cached_depth_ = true;
-        cv::Mat tmp_depth; std::swap(tmp_depth, infer_output_context.result_depth); std::swap(cached_depth_, tmp_depth);
-        cv::Mat tmp_vis; std::swap(tmp_vis, infer_output_context.depth_vis); std::swap(cached_depth_vis_, tmp_vis);
     } else if (has_cached_depth_) {
-        // 使用缓存的深度结果
+        // 使用缓存的深度结果（浅拷贝，零像素拷贝）
         infer_output_context.result_depth = cached_depth_;
-        infer_output_context.depth_vis = cached_depth_vis_;
+        infer_output_context.depth_vis    = cached_depth_vis_;
     }
-    
+
     {
-        PhaseTimer t("Motion_State");
+        PIPELINE_PHASE_SCOPE("Motion_State");
         updateMotionStates(frame_input_context, infer_output_context);
+    }
+
+    if (run_depth) {
+        // 运动状态计算完成后再缓存深度结果：swap 零拷贝。
+        // 注意不能在 updateMotionStates 之前 swap —— swap 会把
+        // infer_output_context.result_depth 清空，导致运动状态拿到空深度图。
+        cv::Mat tmp_depth;
+        std::swap(tmp_depth, infer_output_context.result_depth);
+        std::swap(cached_depth_, tmp_depth);
+        cv::Mat tmp_vis;
+        std::swap(tmp_vis, infer_output_context.depth_vis);
+        std::swap(cached_depth_vis_, tmp_vis);
     }
 }
 
 void Pipeline::updateTracker(InferOutputContext & infer_output_context) {
     const auto & detections = infer_output_context.detections;
-    std::vector<Object> objects;
-    objects.reserve(detections.size());  // 预分配，避免重分配
+    tracker_objects_buf_.clear();
+    tracker_objects_buf_.reserve(detections.size());
 
     for (const auto & det : detections) {
         if (!isTrackingClass(det.classId)) continue;
-        objects.push_back({
+        tracker_objects_buf_.push_back({
             cv::Rect_<float>(det.bbox[0], det.bbox[1],
                              det.bbox[2] - det.bbox[0], det.bbox[3] - det.bbox[1]),
             det.classId, det.conf, 0.0f});
     }
-    infer_output_context.tracked_objects = tracker_.update(objects);
+    infer_output_context.tracked_objects = tracker_.update(tracker_objects_buf_);
 }
 
 void Pipeline::updateMotionStates(FrameInputContext &  frame_input_context,

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 class Pipeline {
   public:
@@ -23,13 +24,13 @@ class Pipeline {
     void init();
 
     // 核心推理接口，供正常业务和 Benchmark 调用
-    __attribute__((hot)) __attribute__((hot)) void process(FrameInputContext &  frame_input_context,
-                 InferOutputContext & infer_output_context);
-    __attribute__((hot)) __attribute__((hot)) void processOverlap(FrameInputContext &  frame_input_context,
-                        InferOutputContext & infer_output_context);
+    __attribute__((hot)) void process(FrameInputContext &  frame_input_context,
+                                      InferOutputContext & infer_output_context);
+    __attribute__((hot)) void processOverlap(FrameInputContext &  frame_input_context,
+                                             InferOutputContext & infer_output_context);
 
-    __attribute__((hot)) __attribute__((hot)) void updateMotionStates(FrameInputContext &  frame_input_context,
-                            InferOutputContext & infer_output_context);
+    __attribute__((hot)) void updateMotionStates(FrameInputContext &  frame_input_context,
+                                                 InferOutputContext & infer_output_context);
 
     cv::Scalar getColor(int idx) { return tracker_.getColor(idx); }
 
@@ -42,7 +43,7 @@ class Pipeline {
     MotionStateEngine & getMotionStateEngine() { return motion_state_engine_; }
 
   private:
-    __attribute__((hot)) __attribute__((hot)) void updateTracker(InferOutputContext & infer_output_context);
+    __attribute__((hot)) void updateTracker(InferOutputContext & infer_output_context);
 
     YoloDetectModel detector_;
     DepthModel      depth_model_;
@@ -62,7 +63,7 @@ class Pipeline {
     static constexpr int kMinTrackArea = 20;  // 最小跟踪面积阈值
 
     bool is_normalize_ = false;
-    
+
     // depth_interval 优化：隔帧执行深度推理
     int  depth_interval_ = 1;
     int  depth_frame_counter_ = 0;
@@ -71,4 +72,7 @@ class Pipeline {
     bool    has_cached_depth_ = false;
     cv::Mat cached_depth_;
     cv::Mat cached_depth_vis_;
+
+    // 每帧复用的跟踪输入缓冲，避免热路径堆分配
+    std::vector<Object> tracker_objects_buf_;
 };

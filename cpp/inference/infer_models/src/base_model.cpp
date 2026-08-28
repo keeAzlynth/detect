@@ -126,16 +126,13 @@ bool BaseModel::runInferenceAsync(FrameInputContext & frame_input_context) {
     } else if (backend_->getBackendType() == BackendType::TensorRT) {
         // TensorRT 异步路径：预处理→推理→后处理全在 GPU Stream 上排队，CPU 不等待
         cudaPreProcess(frame_input_context);
-        // 预分配 output_buffers（静态，跨帧复用）
-        static std::vector<void *> output_buffers_async;
-        if (output_buffers_async.capacity() < d_infer_io_.size() - 1) {
-            output_buffers_async.reserve(d_infer_io_.size() - 1);
-        }
-        output_buffers_async.clear();
+        // 输出指针表复用实例成员（避免每帧堆分配；实例成员保证多实例隔离）
+        inference_buffers_async_.clear();
+        inference_buffers_async_.reserve(d_infer_io_.size() - 1);
         for (auto it = d_infer_io_.begin() + 1; it != d_infer_io_.end(); ++it) {
-            output_buffers_async.push_back(it->get());
+            inference_buffers_async_.push_back(it->get());
         }
-        backend_->runInferenceAsync(d_infer_io_[0].get(), output_buffers_async, stream_);
+        backend_->runInferenceAsync(d_infer_io_[0].get(), inference_buffers_async_, stream_);
         // 异步后处理
         cudaPostProcess(frame_input_context);
         return true;
@@ -150,17 +147,15 @@ bool BaseModel::runInference(FrameInputContext &  frame_input_context,
         APP_ERROR("Model not initialized");
         return false;
     }
-    // 预分配 output_buffers（静态，跨帧复用）
-    static std::vector<void *> output_buffers;
-    if (output_buffers.capacity() < static_cast<size_t>(getNumOutputs())) {
-        output_buffers.reserve(getNumOutputs());
-    }
-    output_buffers.clear();
+    // 输出指针表复用实例成员（避免每帧堆分配；实例成员保证多实例隔离）
+    inference_buffers_.clear();
+    inference_buffers_.reserve(getNumOutputs());
     if (backend_->getBackendType() == BackendType::OnnxRuntime) {
         std::vector<float> onnx_input_tensor = cvMatPreProcess(frame_input_context);
-        std::transform(h_infer_out_.begin(), h_infer_out_.end(), std::back_inserter(output_buffers),
-                       [](auto & v) { return v.data(); });
-        backend_->runInference(onnx_input_tensor.data(), output_buffers);
+        for (auto & v : h_infer_out_) {
+            inference_buffers_.push_back(v.data());
+        }
+        backend_->runInference(onnx_input_tensor.data(), inference_buffers_);
         cvMatPostProcess(infer_output_context);
         return true;
     } else if (backend_->getBackendType() == BackendType::TensorRT) {
@@ -168,9 +163,9 @@ bool BaseModel::runInference(FrameInputContext &  frame_input_context,
         cudaPreProcess(frame_input_context);
         synchronizeStream();  // 确保预处理数据就绪后再推理
         for (auto it = d_infer_io_.begin() + 1; it != d_infer_io_.end(); ++it) {
-            output_buffers.push_back(it->get());
+            inference_buffers_.push_back(it->get());
         }
-        backend_->runInference(d_infer_io_[0].get(), output_buffers);
+        backend_->runInference(d_infer_io_[0].get(), inference_buffers_);
         // 异步后处理
         cudaPostProcess(frame_input_context);
         getInferOutputResult(infer_output_context);

@@ -95,6 +95,7 @@ void YoloDetectModel::init(std::map<std::string, std::string> model_path,
         letterbox_r_ = std::min(r_w, r_h);
         letterbox_pad_h_ = (input_h_ - letterbox_r_ * raw_img_h_) / 2.0f;
         letterbox_pad_w_ = (input_w_ - letterbox_r_ * raw_img_w_) / 2.0f;
+        letterbox_inv_r_ = 1.0f / letterbox_r_;
     }
 
     APP_INFO("YOLO model initialized successfully");
@@ -127,34 +128,35 @@ void YoloDetectModel::cudaPostProcess(FrameInputContext & frame_input_context) {
 
 void YoloDetectModel::getInferOutputResult(InferOutputContext & infer_output_context) {
     synchronizeStream();
-    std::vector<Detection> vDetections;
-    int count = std::min(static_cast<int>(h_infer_out_pinned_.get()[0]), MAX_NUM_OUTPUT_BBOX);
+    const float * out = h_infer_out_pinned_.get();
+    const int     count = std::min(static_cast<int>(out[0]), MAX_NUM_OUTPUT_BBOX);
+
+    // 直接写入输出上下文，避免临时 vector 的重复分配与整体赋值
+    std::vector<Detection> & vDetections = infer_output_context.detections;
+    vDetections.clear();
+    vDetections.reserve(static_cast<size_t>(count));
+
+    const float inv_r = letterbox_inv_r_;
+    const float pad_w = letterbox_pad_w_;
+    const float pad_h = letterbox_pad_h_;
 
     for (int i = 0; i < count; i++) {
-        int pos      = 1 + i * NUM_BOX_ELEMENT;
-        int keepFlag = static_cast<int>(h_infer_out_pinned_.get()[pos + 6]);
+        const int pos      = 1 + i * NUM_BOX_ELEMENT;
+        const int keepFlag = static_cast<int>(out[pos + 6]);
 
         if (keepFlag == 1) {
-            Detection det;
-            memcpy(det.bbox.data(), &h_infer_out_pinned_.get()[pos], 4 * sizeof(float));
-            det.conf    = h_infer_out_pinned_.get()[pos + 4];
-            det.classId = static_cast<int>(h_infer_out_pinned_.get()[pos + 5]);
-            // 将模型坐标系下的 bbox 反算回原始图像坐标系
-            // 模型输入经过了 letterbox 缩放 + 灰边填充，此处逆向：先减去灰边偏移，再除以缩放比例
-            float r_w   = input_w_ / (raw_img_w_ * 1.0);
-            float r_h   = input_h_ / (raw_img_h_ * 1.0);
-            float r     = std::min(r_w, r_h);
-            float pad_h = (input_h_ - r * raw_img_h_) / 2;
-            float pad_w = (input_w_ - r * raw_img_w_) / 2;
-            det.bbox[0] = (det.bbox[0] - pad_w) / r;
-            det.bbox[1] = (det.bbox[1] - pad_h) / r;
-            det.bbox[2] = (det.bbox[2] - pad_w) / r;
-            det.bbox[3] = (det.bbox[3] - pad_h) / r;
-            vDetections.push_back(det);
+            Detection & det = vDetections.emplace_back();
+            std::memcpy(det.bbox.data(), &out[pos], 4 * sizeof(float));
+            det.conf    = out[pos + 4];
+            det.classId = static_cast<int>(out[pos + 5]);
+            // 将模型坐标系下的 bbox 反算回原始图像坐标系：
+            // 模型输入经过 letterbox 缩放 + 灰边填充，逆向为先减灰边偏移再乘缩放倒数
+            det.bbox[0] = (det.bbox[0] - pad_w) * inv_r;
+            det.bbox[1] = (det.bbox[1] - pad_h) * inv_r;
+            det.bbox[2] = (det.bbox[2] - pad_w) * inv_r;
+            det.bbox[3] = (det.bbox[3] - pad_h) * inv_r;
         }
     }
-
-    infer_output_context.detections = vDetections;
 }
 
 std::vector<float> YoloDetectModel::cvMatPreProcess(FrameInputContext & frame_input_context) {
@@ -250,16 +252,11 @@ void YoloDetectModel::cvMatPostProcess(InferOutputContext & infer_output_context
         det.conf    = scores[i];
         det.classId = classIds[i];
 
-        // 坐标还原（与 getInferOutputResult 逻辑保持一致）
-        float r_w   = input_w_ / (raw_img_w_ * 1.0f);
-        float r_h   = input_h_ / (raw_img_h_ * 1.0f);
-        float r     = std::min(r_w, r_h);
-        float pad_h = (input_h_ - r * raw_img_h_) / 2.0f;
-        float pad_w = (input_w_ - r * raw_img_w_) / 2.0f;
-        det.bbox[0] = (det.bbox[0] - pad_w) / r;
-        det.bbox[1] = (det.bbox[1] - pad_h) / r;
-        det.bbox[2] = (det.bbox[2] - pad_w) / r;
-        det.bbox[3] = (det.bbox[3] - pad_h) / r;
+        // 坐标还原（与 getInferOutputResult 逻辑保持一致，使用预计算 letterbox 常量）
+        det.bbox[0] = (det.bbox[0] - letterbox_pad_w_) * letterbox_inv_r_;
+        det.bbox[1] = (det.bbox[1] - letterbox_pad_h_) * letterbox_inv_r_;
+        det.bbox[2] = (det.bbox[2] - letterbox_pad_w_) * letterbox_inv_r_;
+        det.bbox[3] = (det.bbox[3] - letterbox_pad_h_) * letterbox_inv_r_;
 
         vDetections.push_back(det);
     }

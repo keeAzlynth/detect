@@ -121,6 +121,10 @@ class BaseModel {
     bool                               initialized_ = false;
     // 模型输入输出缓冲区: d_infer_io_[0] -> input, d_infer_io_[1] -> output
     std::vector<unique_ptr_cuda<void>> d_infer_io_;
+    // 推理输出指针表（实例成员，跨帧复用，避免每帧堆分配；
+    // 此前为 function-local static，多实例（YOLO/Depth）会互相踩踏）
+    std::vector<void*> inference_buffers_;
+    std::vector<void*> inference_buffers_async_;
     std::unique_ptr<InferenceBackend>  backend_;
     cudaStream_t                       stream_;
     std::vector<std::vector<float>>    h_infer_out_;

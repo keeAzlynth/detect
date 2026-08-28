@@ -108,26 +108,25 @@ MotionStateInfoRecord MotionStateEngine::computeMotionState(int    track_id,
     return MotionStateInfoRecord(direction_state, accel_state, current_velocity);
 }
 
-float MotionStateEngine::getObjectDepth(cv::Mat depth, const STrack & track, cv::Size image_size) {
+float MotionStateEngine::getObjectDepth(const cv::Mat & depth,
+                                        const STrack &  track,
+                                        cv::Size        image_size) {
     if (depth.empty()) {
         APP_WARN("depth_map is empty!");
         return 0.0f;
     }
     // 避免每帧 resize：depth 已经是目标分辨率（depth_model 输出为 raw_img_h x raw_img_w）
-    // 直接使用，仅在尺寸不匹配时 resize
+    // 直接使用，仅在尺寸不匹配时 resize 到局部副本
     if (depth.rows != image_size.height || depth.cols != image_size.width) {
-        cv::resize(depth, depth, image_size);
+        cv::Mat resized;
+        cv::resize(depth, resized, image_size);
+        return computeMeanDepth(resized, track.tlwh_);
     }
 
-    const std::vector<float> & tlwh        = track.tlwh_;
-    float                      depth_value = 0.0f;
-
-    depth_value = computeMeanDepth(depth, tlwh);
-
-    return depth_value;
+    return computeMeanDepth(depth, track.tlwh_);
 }
 
-float MotionStateEngine::computeMeanDepth(cv::Mat                    depth,
+float MotionStateEngine::computeMeanDepth(const cv::Mat &            depth,
                                           const std::vector<float> & tlwh,
                                           int                        num_samples) const {
     int left   = static_cast<int>(tlwh[0]);

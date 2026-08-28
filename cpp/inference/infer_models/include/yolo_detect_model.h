@@ -51,6 +51,7 @@ class YoloDetectModel : public BaseModel {
     float letterbox_r_ = 1.0f;    // letterbox 缩放比（预计算）
     float letterbox_pad_w_ = 0.0f; // letterbox 水平灰边（预计算）
     float letterbox_pad_h_ = 0.0f; // letterbox 垂直灰边（预计算）
+    float letterbox_inv_r_ = 1.0f; // 1/letterbox_r_（预计算，bbox 反算用乘法代替除法）
 
   public:
     // 常量

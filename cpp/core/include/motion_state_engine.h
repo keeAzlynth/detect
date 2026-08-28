@@ -10,7 +10,7 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 
-const std::map<std::pair<MotionState, MotionState>, std::string> MOTION_STR_MAP = {
+inline const std::map<std::pair<MotionState, MotionState>, std::string> MOTION_STR_MAP = {
     { { MotionState::STABLE, MotionState::CONSTANT },    "Stable"               },
     { { MotionState::APPROACH, MotionState::ACCELE },    "Approach (Accele)"    },
     { { MotionState::APPROACH, MotionState::DECELE },    "Approach (Decele)"    },
@@ -29,9 +29,9 @@ class MotionStateEngine {
 
     MotionStateInfoRecord computeMotionState(int track_id, float raw_depth, double timestamp);
 
-    float getObjectDepth(cv::Mat depth, const STrack & track, cv::Size image_size);
+    float getObjectDepth(const cv::Mat & depth, const STrack & track, cv::Size image_size);
 
-    float computeMeanDepth(cv::Mat                    depth,
+    float computeMeanDepth(const cv::Mat &           depth,
                            const std::vector<float> & tlwh,
                            int                        num_samples = 64) const;
 

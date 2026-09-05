@@ -3,13 +3,13 @@
 > Jetson Nano 实时目标检测 + 单目深度估计加速版（重构自 [yzfzzz/depth-detect](https://github.com/yzfzzz/depth-detect)）
 
 面向 **Jetson Nano（Tegra X1）** 压榨性能的实时深度检测管线：
-YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT FP16 引擎加速 + CUDA 预处理/后处理。
+YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT INT8 引擎加速（FP16/FP32 备选）+ CUDA 预处理/后处理。
 
 ---
 
 ## 一、核心特性
 
-- **双模型推理**：YOLOv8n 目标检测 + Lite-Mono-Tiny 单目深度估计，TensorRT 8.2 FP16 引擎
+- **双模型推理**：YOLOv8n 目标检测 + Lite-Mono-Tiny 单目深度估计，TensorRT 8.2 INT8 引擎（FP16/FP32 保留备用）
 - **纯 GPU 管线**：CUDA 预处理（letterbox/归一化）+ CUDA 后处理（NMS），`--use_fast_math`
 - **目标跟踪**：ByteTrack + 卡尔曼滤波，支持目标运动状态（趋近/远离/加减速）判断
 - **异步重叠**：`overlap: true` 时读帧线程与主循环重叠；YOLO 与 Depth 通过各自 CUDA 流真并行（Depth 先发车，YOLO 等待/跟踪期间 Depth 持续计算）
@@ -18,16 +18,19 @@ YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT FP16 引擎加速 + CUD
 - **多输入**：H.264 视频文件 / USB 摄像头（`/dev/video0`）两种输入
 - **性能模式脚本**：`perf.sh` 一键内核调优（MAXN + jetson_clocks + performance governor）
 
-### 实测性能（Jetson Nano, FP16, MAXN, 2026-08-28）
+### 实测性能（Jetson Nano, MAXN 锁频）
 
 | 场景 | 结果 |
 |---|---|
-| 视频文件 (1shu_east_0514.mp4, 30fps) | **6.54 fps**（单帧推理 ~153ms；含绘图+JPEG 落盘的墙钟 ~162ms/帧），800 帧内波动 ±0.01 |
-| USB 摄像头 (性能模式) | 稳态约 6.5 fps |
-| 启动 | ~24s（单 Pipeline 实例，反序列化 2 个引擎）；首帧 TRT/cuDNN 自动调优已由预热吸收，主循环第一帧即稳态 |
-| 内存 | 单实例后运行内存约减半，4GB 板上无换页抖动 |
+| 视频文件 (1shu_east_0514.mp4, 30fps)，**INT8 双引擎** | **7.40 fps**（单帧推理 ~135ms），1000 帧稳态波动 ≤0.01（2026-09-05） |
+| 深度隔帧 `depth_interval: 2`（INT8） | **10.42 fps**，深度更新率减半，待业务确认后可启用 |
+| FP16 双引擎（对照） | 6.53 fps（单帧推理 ~153ms） |
+| USB 摄像头 | 未单独基准（GPU 工作量与视频模式相同，预期同量级） |
+| 启动 | ~24s（反序列化 2 个引擎）；首帧 TRT/cuDNN 自动调优已由预热吸收，主循环第一帧即稳态 |
+| 内存 | 4GB 板上无换页抖动 |
 
-> 2026-08-28 优化记录：此前版本 `main.cpp` 与 `AsyncPipeline` 各自隐式加载一份 Pipeline（4 次引擎反序列化、显存翻倍），在 4GB 板上会触发换页抖动导致阶段耗时 7~85ms 剧烈波动；深度缓存 swap 顺序错误导致运动状态判定每帧拿到空深度图。以上问题已修复（commit 469f09b）。
+> 历史问题（commit 469f09b 已修）：更早版本 `main.cpp` 与 `AsyncPipeline` 各自隐式加载一份
+> Pipeline（4 次引擎反序列化、显存翻倍），在 4GB 板上触发换页抖动导致阶段耗时 7~85ms 剧烈波动。
 
 ---
 
@@ -59,7 +62,7 @@ depth-detect-turbo/
 │   ├── tools/                    # 绘制(FPS/检测框) + 计时
 │   └── utils/                    # 配置加载 + 日志
 ├── model/
-│   ├── engine/                   # 已导出的 FP16/FP32 TRT 引擎
+│   ├── engine/                   # 已导出的 INT8/FP16/FP32 TRT 引擎
 │   └── onnx/                     # ONNX 回退模型
 ├── third_party/                  # spdlog / onnxruntime / JsonSender
 ├── bin/
@@ -197,10 +200,10 @@ sudo nice -n -10 ./main 0 config.yaml
 - [x] letterbox 常量真正复用 + 乘倒数替代除法；`cv::Mat` 热路径传参改 `const &`
 - [x] `PhaseTimer` 编译期开关（`-DPIPELINE_PHASE_TIMER=ON` 可开，默认零开销）
 
-已完成（2026-09-05，本轮，6.53 → 7.41 fps / +13%）：
+已完成（2026-09-05，本轮，6.53 → 7.40 fps / +13%）：
 
-- [x] **INT8 引擎落地**：YOLOv8n + Lite-Mono-Tiny 双模型 INT8（熵校准 370 帧），应用内 6.53 → 7.41 fps。
-      检测框与深度伪彩视觉验证与 FP16 无可感知差异（同帧对比）。
+- [x] **INT8 引擎落地**：YOLOv8n + Lite-Mono-Tiny 双模型 INT8（熵校准 370 帧），应用内 6.53 → 7.40 fps
+      （1000 帧稳态）。检测框与深度伪彩视觉验证与 FP16 无可感知差异（同帧对比）。
       ⚠️ 实测结论：Maxwell（sm_53）在 TRT 8.2 下**没有真正的 INT8 卷积 kernel**——nvprof 显示卷积
       全部回退 FP16 winograd / FP32 sgemm（`cuInt8::nchwToNchhw2` 只有量化搬运），收益来自
       逐层策略重选：YOLO +4%、Depth +17%（trtexec 单测），应用内合计 +13%。INT8 在本卡上已到头，
@@ -220,30 +223,23 @@ sudo nice -n -10 ./main 0 config.yaml
 - [x] 性能分析方法论：trtexec 单引擎基线 + nvprof 逐 kernel 分解 + tegrastats。
       帧时间 ≈ 两模型 GPU 时间之和（双流在饱和 GPU 上无真并行），该结论已实测闭环。
 
-本轮踩坑 / 问题记录（2026-09-05）：
+本轮问题记录（2026-09-05，均与代码/性能直接相关）：
 
-- **GitHub 推送不通**：手机热点封锁 github.com:22，`git push` 静默挂死无输出。
-  解法：板上 `~/.ssh/config` 把 `github.com` 永久指向 `ssh.github.com:443`。
-- **apt update 连接 127.0.0.1:7897 被拒**：`/etc/apt/apt.conf` 残留指向板子本机的旧代理。
-  代理 IP 变更时同步检查四处：`/etc/environment`、`~/.bashrc`、`/etc/apt/apt.conf`、
-  `/etc/apt/apt.conf.d/95proxy`。
-- **pageable 内存 H2D 隐式设备同步**：读帧线程直接 `cudaMemcpyAsync(pageable→device)` 会与
-  主循环 enqueueV2 相撞，kernel 发射拖大 4 倍（Depth 49ms vs trtexec 11.4ms，p90 46ms 双峰）。
-  已改 pinned 暂存修复；该 CPU 停顿此前被 GPU 饱和掩盖，对帧率无直接影响。
-- **swap 缓存清空 depth_vis**：上一轮引入的落盘图缺深度半区 bug（1280x720 ≠ 设计的
-  1280x1440）。教训：对"零拷贝优化"要用输出物验证——对比落盘图片尺寸即可发现。
-- **sm_53 的 INT8 架构限制**：INT8 引擎能建能跑，但 nvprof 证实无 INT8 卷积 kernel，
-  卷积全部回退 FP16/FP32。校准工具链保留（`~/build_int8.py` + `~/trt_int8/*cache`），
-  但不要再期待量化层面的进一步收益。
-- **nvprof 使用注意**：必须 sudo（否则 ERR_NVGPUCTRPERM 且无输出）；CUDA 10.2 没有
-  `--print-summary-per-gpu-kernel`（用 `--print-summary`）；被 timeout SIGTERM 后 nvprof
-  收尾可能挂起（exit 124），但 profile 数据完整落盘。
+- **pageable 内存 H2D 隐式设备同步**（已修）：读帧线程直接 `cudaMemcpyAsync(pageable→device)`
+  会与主循环 TRT enqueueV2 相撞，kernel 发射拖大 4 倍（Depth 发射实测 49ms vs trtexec 11.4ms，
+  p90 46ms 双峰）。已改 pinned 暂存；该 CPU 停顿此前被 GPU 饱和掩盖，对帧率无直接影响。
+- **swap 缓存清空 depth_vis**（已修）：上一轮 swap 零拷贝缓存把 `depth_vis` 从 context 换走，
+  落盘图长期缺深度半区（1280x720 ≠ 设计的 1280x1440）。教训：对"零拷贝优化"要用输出物验证，
+  对比落盘图片尺寸即可发现。
+- **sm_53 的 INT8 架构限制**（已实测闭环）：INT8 引擎能建能跑，但无 INT8 卷积 kernel，卷积全部
+  回退 FP16/FP32。校准工具链保留（`~/build_int8.py` + `~/trt_int8/*cache`），不要再期待量化层面
+  的进一步收益。
 - **遗留问题**：应用收尾退出偏慢（teardown 阶段 cuModuleUnload ×594 ≈ 2.6s + cudaFree），
   不影响稳态帧率；启动 ~24s 引擎反序列化仍是待做项。
 
 待做 / 候选方向：
 
-- [ ] `depth_interval: 2` 评估：深度隔帧，INT8 后预估 ~9.5-10 fps，代价是深度更新率减半（需业务侧确认精度）
+- [ ] `depth_interval: 2`：深度隔帧，INT8 后**实测 10.42 fps**，代价是深度更新率减半（需业务侧确认精度）
 - [ ] 减小 YOLO 输入分辨率（640→512/416）：需从 .pt 重新导出 ONNX（板上只有固定 640 的 ONNX，
       直接改图会破坏 neck 里 Resize 的常数尺度）
 - [ ] YOLO letterbox 双 kernel 融合（letterbox+CHW 各写一遍 640x640，nvprof 实测 letterbox 2.8ms/帧）

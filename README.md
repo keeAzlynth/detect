@@ -213,8 +213,10 @@ sudo nice -n -10 ./main 0 config.yaml
       `depth_vis` 换入缓存，导致主循环绘图/落盘拿到空 Mat——`depth_interval=1` 时每帧存出的
       图都只有上半原图（1280x720 而非设计的 1280x1440 拼接图）。改为 Mat 浅拷贝缓存（仍零像素拷贝）。
 - [x] INT8 校准工具链：`~/build_int8.py`（pycuda + IInt8EntropyCalibrator2），
-      校准图 `~/calib_int8/`（370 帧），校准缓存与引擎 `~/trt_int8/`（引擎已装入
-      `model/engine/*/`，gitignore 不入库）。
+      校准缓存保留在 `~/trt_int8/`（重建引擎免重校准），引擎已装入
+      `model/engine/*/`（gitignore 不入库）。校准图已清理（370 帧，49MB），
+      需重新校准时从任意测试视频一键重抽：
+      `ffmpeg -i <视频> -vf select='not(mod(n,7))' -vsync vfr -q:v 2 ~/calib_int8/img_%04d.jpg`
 - [x] 性能分析方法论：trtexec 单引擎基线 + nvprof 逐 kernel 分解 + tegrastats。
       帧时间 ≈ 两模型 GPU 时间之和（双流在饱和 GPU 上无真并行），该结论已实测闭环。
 

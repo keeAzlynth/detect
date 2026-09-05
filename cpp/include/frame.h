@@ -77,6 +77,9 @@ struct FrameInputContext {
     FrameMeta              meta;
     double                 timestamp;
     unique_ptr_cuda<uchar> d_raw_img_;
+    // 读帧线程的 pinned 暂存缓冲：pageable 内存直接 cudaMemcpyAsync 会触发
+    // 驱动内隐式设备同步，与主循环 TRT enqueueV2 撞车（实测 Depth 发射 49ms vs 12ms）
+    unique_ptr_pinned_cuda<uchar> h_pinned_;
     cv::Mat                raw_img;
     size_t                 img_size;
 };

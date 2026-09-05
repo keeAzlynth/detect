@@ -110,15 +110,11 @@ void Pipeline::process(FrameInputContext &  frame_input_context,
     }
 
     if (run_depth) {
-        // 运动状态计算完成后再缓存深度结果：swap 零拷贝。
-        // 注意不能在 updateMotionStates 之前 swap —— swap 会把
-        // infer_output_context.result_depth 清空，导致运动状态拿到空深度图。
-        cv::Mat tmp_depth;
-        std::swap(tmp_depth, infer_output_context.result_depth);
-        std::swap(cached_depth_, tmp_depth);
-        cv::Mat tmp_vis;
-        std::swap(tmp_vis, infer_output_context.depth_vis);
-        std::swap(cached_depth_vis_, tmp_vis);
+        // 运动状态计算完成后缓存深度结果：Mat 浅拷贝（引用计数，零像素拷贝）。
+        // 注意不能用 swap 把结果从 context 换走——主循环的绘图/落盘还要读
+        // infer_output_context.depth_vis，swap 清空后存出的图会缺整个深度半区。
+        cached_depth_     = infer_output_context.result_depth;
+        cached_depth_vis_ = infer_output_context.depth_vis;
     }
 }
 
@@ -169,15 +165,11 @@ void Pipeline::processOverlap(FrameInputContext &  frame_input_context,
     }
 
     if (run_depth) {
-        // 运动状态计算完成后再缓存深度结果：swap 零拷贝。
-        // 注意不能在 updateMotionStates 之前 swap —— swap 会把
-        // infer_output_context.result_depth 清空，导致运动状态拿到空深度图。
-        cv::Mat tmp_depth;
-        std::swap(tmp_depth, infer_output_context.result_depth);
-        std::swap(cached_depth_, tmp_depth);
-        cv::Mat tmp_vis;
-        std::swap(tmp_vis, infer_output_context.depth_vis);
-        std::swap(cached_depth_vis_, tmp_vis);
+        // 运动状态计算完成后缓存深度结果：Mat 浅拷贝（引用计数，零像素拷贝）。
+        // 注意不能用 swap 把结果从 context 换走——主循环的绘图/落盘还要读
+        // infer_output_context.depth_vis，swap 清空后存出的图会缺整个深度半区。
+        cached_depth_     = infer_output_context.result_depth;
+        cached_depth_vis_ = infer_output_context.depth_vis;
     }
 }
 

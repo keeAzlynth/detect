@@ -197,12 +197,36 @@ sudo nice -n -10 ./main 0 config.yaml
 - [x] letterbox 常量真正复用 + 乘倒数替代除法；`cv::Mat` 热路径传参改 `const &`
 - [x] `PhaseTimer` 编译期开关（`-DPIPELINE_PHASE_TIMER=ON` 可开，默认零开销）
 
+已完成（2026-09-05，本轮，6.53 → 7.40 fps / +13%）：
+
+- [x] **INT8 引擎落地**：YOLOv8n + Lite-Mono-Tiny 双模型 INT8（熵校准 370 帧），应用内 6.53 → 7.40 fps。
+      检测框与深度伪彩视觉验证与 FP16 无可感知差异（同帧对比）。
+      ⚠️ 实测结论：Maxwell（sm_53）在 TRT 8.2 下**没有真正的 INT8 卷积 kernel**——nvprof 显示卷积
+      全部回退 FP16 winograd / FP32 sgemm（`cuInt8::nchwToNchhw2` 只有量化搬运），收益来自
+      逐层策略重选：YOLO +4%、Depth +17%（trtexec 单测），应用内合计 +13%。INT8 在本卡上已到头，
+      进一步提速只能减少 GPU 工作量（见待做）。
+- [x] **读帧 H2D 改 pinned 暂存**（`frame.h` / `io_manager.cpp`）：pageable 内存直接
+      `cudaMemcpyAsync` 会触发驱动隐式设备同步，与主循环 TRT enqueueV2 相撞，把 kernel
+      发射拖大 4 倍（Depth 发射实测 49ms → 12ms，trtexec 单测 11.4ms）。
+      注：该 CPU 停顿此前被 GPU 饱和掩盖，对帧率无直接影响，但消除了 p90 抖动源。
+- [x] **修复落盘缺深度半区 bug**（`pipeline.cpp`）：`process/processOverlap` 末尾用 swap 把
+      `depth_vis` 换入缓存，导致主循环绘图/落盘拿到空 Mat——`depth_interval=1` 时每帧存出的
+      图都只有上半原图（1280x720 而非设计的 1280x1440 拼接图）。改为 Mat 浅拷贝缓存（仍零像素拷贝）。
+- [x] INT8 校准工具链：`~/build_int8.py`（pycuda + IInt8EntropyCalibrator2），
+      校准图 `~/calib_int8/`（370 帧），校准缓存与引擎 `~/trt_int8/`（引擎已装入
+      `model/engine/*/`，gitignore 不入库）。
+- [x] 性能分析方法论：trtexec 单引擎基线 + nvprof 逐 kernel 分解 + tegrastats。
+      帧时间 ≈ 两模型 GPU 时间之和（双流在饱和 GPU 上无真并行），该结论已实测闭环。
+
 待做 / 候选方向：
 
+- [ ] `depth_interval: 2` 评估：深度隔帧，INT8 后实测 10.42 fps（2026-09-05），代价是深度更新率减半（需业务侧确认精度）
+- [ ] 减小 YOLO 输入分辨率（640→512/416）：需从 .pt 重新导出 ONNX（板上只有固定 640 的 ONNX，
+      直接改图会破坏 neck 里 Resize 的常数尺度）
+- [ ] YOLO letterbox 双 kernel 融合（letterbox+CHW 各写一遍 640x640，nvprof 实测 letterbox 2.8ms/帧）
+- [ ] Depth 模型 `naiveSlice` kernel ~4.8ms/帧（模型结构决定的切片 op，需改模型导出才能消除）
 - [ ] 引擎反序列化加速（当前 `/dev/shm` 缓存只写不读，反序列化本身仍是启动 ~24s 的主体）
-- [ ] `depth_interval: 2` 评估：深度隔帧可到 ~8.7 fps，代价是深度更新率减半（需业务侧确认精度）
 - [ ] 报警上报 JSON 轻量化（剥离 JsonSender 或改共享内存）
-- [ ] INT8 量化评估（注意 Tegra X1 为 Maxwell 架构，无 DP4A，加速比预期有限，先实测再投入）
 
 ---
 

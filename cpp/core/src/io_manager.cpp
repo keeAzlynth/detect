@@ -6,6 +6,7 @@
 
 #include <cstdlib>  // For system()
 #include <cctype>      // isdigit
+#include <cstring>     // std::memcpy
 #include <algorithm>   // std::all_of
 
 IOManager::IOManager(const ConfigManager & config_manager) :
@@ -189,9 +190,19 @@ bool IOManager::readNextFrame(FrameInputContext & frame_input_context, bool simu
             CHECK_CUDA(cudaMalloc(&ptr, frame_input_context.img_size));
             frame_input_context.d_raw_img_.reset(static_cast<uchar *>(ptr));
         }
-        CHECK_CUDA(cudaMemcpy(frame_input_context.d_raw_img_.get(),
-                              frame_input_context.raw_img.data, frame_input_context.img_size,
-                              cudaMemcpyHostToDevice));
+        if (!frame_input_context.h_pinned_) {
+            void * ptr = nullptr;
+            CHECK_CUDA(cudaMallocHost(&ptr, frame_input_context.img_size));
+            frame_input_context.h_pinned_.reset(static_cast<uchar *>(ptr));
+        }
+        // 先 CPU 拷入 pinned 暂存，再从 pinned 发起异步 DMA。
+        // 直接对 pageable 源内存做 cudaMemcpyAsync 时驱动会先做一次隐式设备同步，
+        // 与主循环正在进行的 TRT enqueueV2 串行，导致 kernel 发射耗时成倍膨胀。
+        std::memcpy(frame_input_context.h_pinned_.get(), frame_input_context.raw_img.data,
+                    frame_input_context.img_size);
+        CHECK_CUDA(cudaMemcpyAsync(frame_input_context.d_raw_img_.get(),
+                                   frame_input_context.h_pinned_.get(),
+                                   frame_input_context.img_size, cudaMemcpyHostToDevice));
     }
     // 更新下一帧的处理开始时间
     last_frame_start_time_ = std::chrono::steady_clock::now();

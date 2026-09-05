@@ -8,7 +8,7 @@ prefer:
 yolo:
   yolo_model_path:
     - type: engine
-      path: "../model/engine/yolov8n/yolov8n_640_op11_fp16_trt8.2.engine"
+      path: "../model/engine/yolov8n/yolov8n_640_op11_int8_trt8.2.engine"
     - type: onnx
       path: "../model/onnx/yolov8n/yolov8n_640_op11.onnx"
 
@@ -19,7 +19,7 @@ depth:
   depth_interval: 1       # 隔帧推理深度间隔，优化算力占用
   depth_model_path:
     - type: engine
-      path: "../model/engine/lite-mono-tiny/lite-mono-tiny_192x640_op11_fp16_trt8.2.engine"
+      path: "../model/engine/lite-mono-tiny/lite-mono-tiny_192x640_op11_int8_trt8.2.engine"
     - type: onnx
       path: "../model/onnx/lite-mono-tiny/lite-mono-tiny_192x640_op11.onnx"
 

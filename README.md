@@ -197,9 +197,9 @@ sudo nice -n -10 ./main 0 config.yaml
 - [x] letterbox 常量真正复用 + 乘倒数替代除法；`cv::Mat` 热路径传参改 `const &`
 - [x] `PhaseTimer` 编译期开关（`-DPIPELINE_PHASE_TIMER=ON` 可开，默认零开销）
 
-已完成（2026-09-05，本轮，6.53 → 7.40 fps / +13%）：
+已完成（2026-09-05，本轮，6.53 → 7.41 fps / +13%）：
 
-- [x] **INT8 引擎落地**：YOLOv8n + Lite-Mono-Tiny 双模型 INT8（熵校准 370 帧），应用内 6.53 → 7.40 fps。
+- [x] **INT8 引擎落地**：YOLOv8n + Lite-Mono-Tiny 双模型 INT8（熵校准 370 帧），应用内 6.53 → 7.41 fps。
       检测框与深度伪彩视觉验证与 FP16 无可感知差异（同帧对比）。
       ⚠️ 实测结论：Maxwell（sm_53）在 TRT 8.2 下**没有真正的 INT8 卷积 kernel**——nvprof 显示卷积
       全部回退 FP16 winograd / FP32 sgemm（`cuInt8::nchwToNchhw2` 只有量化搬运），收益来自
@@ -218,9 +218,30 @@ sudo nice -n -10 ./main 0 config.yaml
 - [x] 性能分析方法论：trtexec 单引擎基线 + nvprof 逐 kernel 分解 + tegrastats。
       帧时间 ≈ 两模型 GPU 时间之和（双流在饱和 GPU 上无真并行），该结论已实测闭环。
 
+本轮踩坑 / 问题记录（2026-09-05）：
+
+- **GitHub 推送不通**：手机热点封锁 github.com:22，`git push` 静默挂死无输出。
+  解法：板上 `~/.ssh/config` 把 `github.com` 永久指向 `ssh.github.com:443`。
+- **apt update 连接 127.0.0.1:7897 被拒**：`/etc/apt/apt.conf` 残留指向板子本机的旧代理。
+  代理 IP 变更时同步检查四处：`/etc/environment`、`~/.bashrc`、`/etc/apt/apt.conf`、
+  `/etc/apt/apt.conf.d/95proxy`。
+- **pageable 内存 H2D 隐式设备同步**：读帧线程直接 `cudaMemcpyAsync(pageable→device)` 会与
+  主循环 enqueueV2 相撞，kernel 发射拖大 4 倍（Depth 49ms vs trtexec 11.4ms，p90 46ms 双峰）。
+  已改 pinned 暂存修复；该 CPU 停顿此前被 GPU 饱和掩盖，对帧率无直接影响。
+- **swap 缓存清空 depth_vis**：上一轮引入的落盘图缺深度半区 bug（1280x720 ≠ 设计的
+  1280x1440）。教训：对"零拷贝优化"要用输出物验证——对比落盘图片尺寸即可发现。
+- **sm_53 的 INT8 架构限制**：INT8 引擎能建能跑，但 nvprof 证实无 INT8 卷积 kernel，
+  卷积全部回退 FP16/FP32。校准工具链保留（`~/build_int8.py` + `~/trt_int8/*cache`），
+  但不要再期待量化层面的进一步收益。
+- **nvprof 使用注意**：必须 sudo（否则 ERR_NVGPUCTRPERM 且无输出）；CUDA 10.2 没有
+  `--print-summary-per-gpu-kernel`（用 `--print-summary`）；被 timeout SIGTERM 后 nvprof
+  收尾可能挂起（exit 124），但 profile 数据完整落盘。
+- **遗留问题**：应用收尾退出偏慢（teardown 阶段 cuModuleUnload ×594 ≈ 2.6s + cudaFree），
+  不影响稳态帧率；启动 ~24s 引擎反序列化仍是待做项。
+
 待做 / 候选方向：
 
-- [ ] `depth_interval: 2` 评估：深度隔帧，INT8 后实测 10.42 fps（2026-09-05），代价是深度更新率减半（需业务侧确认精度）
+- [ ] `depth_interval: 2` 评估：深度隔帧，INT8 后预估 ~9.5-10 fps，代价是深度更新率减半（需业务侧确认精度）
 - [ ] 减小 YOLO 输入分辨率（640→512/416）：需从 .pt 重新导出 ONNX（板上只有固定 640 的 ONNX，
       直接改图会破坏 neck 里 Resize 的常数尺度）
 - [ ] YOLO letterbox 双 kernel 融合（letterbox+CHW 各写一遍 640x640，nvprof 实测 letterbox 2.8ms/帧）

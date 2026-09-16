@@ -229,6 +229,15 @@ def main():
             f.write(config.get_timing_cache().serialize())
         log(f'写出 timing cache {args.timing_cache}')
 
+    # ⚠️ 必须显式 pop 掉上下文：否则 pycuda 在解释器退出时会报
+    #    "PyCUDA ERROR: The context stack was not empty upon module cleanup"
+    #    并以 rc=134(SIGABRT) 退出 —— 引擎其实已经写好了，但退出码会让外层脚本误判失败。
+    try:
+        _ctx.pop()
+    except Exception:
+        pass
+    log('上下文已释放，正常退出')
+
 
 if __name__ == '__main__':
     main()

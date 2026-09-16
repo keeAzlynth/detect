@@ -65,3 +65,6 @@ data/*.mov
 
 # Shared memory cache
 /dev/shm/trt_engine_*
+
+# TRT calibration cache (data-dependent, do not commit)
+*.cache

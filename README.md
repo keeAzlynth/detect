@@ -28,10 +28,26 @@ YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT INT8 引擎加速（FP1
 
 | 场景 | 推理管线 fps | 端到端 fps |
 |---|---|---|
-| 视频文件 (1shu_east_0514.mp4, 30fps)，INT8 双引擎 | 7.47（单帧 135ms） | **7.22（单帧 138.5ms）** |
+| 固定 300 帧素材（test300.mp4），INT8 双引擎，`depth_interval: 1` | 7.47（单帧 135ms） | **7.22（单帧 138.5ms）** |
 | USB 摄像头 640×360，INT8 双引擎 | 7.60 | 7.1–7.5 |
-| 深度隔帧 `depth_interval: 2`（INT8） | 10.42（旧构建） | 待复测，见第九节 |
+| 深度隔帧 `depth_interval: 2`（INT8，与上一行同一构建实测） | 10.50 | **10.01（单帧 99.9ms，+38.6%）** |
 | FP16 双引擎（量化改造前的对照，管线口径） | 6.53（单帧 153ms） | — |
+
+> ⚠️ `depth_interval: 2` 的**平均值具有欺骗性**：帧时间呈双峰分布 —— 跑深度的帧 ≈134ms（7.5 fps）、
+> 跳过的帧 ≈57ms（17.7 fps），平均 10 fps 是这两簇的混合值。帧间隔在 **57↔134ms 之间反复跳变**，
+> 下游若假定恒定帧间隔（播放器缓冲、编码器码率、告警节流）要按最坏帧时间而不是平均值设计。
+> 还附带两处容易被忽略的语义代价，见第九节。
+
+**GPU 时间去哪了**（`trtexec` 直接实测单次推理，锁频）：
+
+| 模型 | INT8 | FP16 | FP32 |
+|---|---|---|---|
+| YOLOv8n @640×640 | **50.11 ms** | 52.16 | — |
+| Lite-Mono-Tiny @192×640 | **77.76 ms** | 94.30 | 98.19 |
+
+两者合计 127.9ms，占单帧墙钟 138.5ms 的 **92.4%**；且 `1/Throughput ≈ GPU Compute Time`
+（相差仅 0.5–0.9ms）说明**帧内没有气泡、GPU 利用率 ≈99%**。
+账目完全闭合：`138.5 = 50.1(YOLO) + 77.8(Depth) + 6.1(app 侧 CPU) + 4.75(concat)`。
 
 > 同一个 INT8 版本，管线口径 7.40 而端到端只有 6.58 —— 那 17ms 差在主循环里画框和压 JPEG，
 > 期间 GPU 是空转的。这是 2026-09-16 那轮优化解决的事，见第九节。
@@ -83,6 +99,7 @@ depth-detect-turbo/
 │   ├── main                      # 可执行文件（cmake 生成）
 │   └── config.yaml               # 运行配置
 ├── perf.sh                       # 性能模式 / 内核调优脚本
+├── scripts/                      # 引擎重建工具（build_engine.py / calib_precheck.py），见第十节
 └── CMakeLists.txt                # 精简版构建脚本
 ```
 
@@ -209,6 +226,12 @@ sudo nice -n -10 ./main 0 config.yaml
 | `Cannot open shared memory file: /dev/shm/trt_engine_*.cache` | 正常：`saveEngineToShm()` 写缓存失败，而 `loadEngineFromShm()` 根本没被调用，属死代码，不影响运行 |
 | 编译到一半整机卡死 | 4GB 板内存打满触发换页。见第四节：`ulimit -v 2621440` + 低 `-j` |
 | pip 装包 ProxyError | 板子走代理时用 `env -u http_proxy -u https_proxy ...` 绕开 |
+| `trtexec --dumpProfile` 的单层耗时加起来远大于 `GPU Compute Time` | 正常：该表被 CUPTI 仪器开销**放大约 1.5×**，且 `{ForeignNode[...]}` / `Conv` 这类孤立大条目是**归因伪影**（真 kernel 的耗时会随精度变化，伪影几乎不变）。**千万不要照着「表里最慢的那一层」去重构网络** |
+| 自己重建的引擎比现役的还快 | 先查 `--workspace`：`trtexec` 默认**只有 16MB**，TRT 拿不到大 tile 的 scratch 显存就会退到 FP32 sgemm。生产构建请显式 `--workspace=2048`（本次实测差 17%） |
+| `trtexec --int8` 建出来的引擎并没有更快 | 正常：**没有校准数据时 INT8 无法真正启用**，缺 dynamic range 的层会整体退回 FP16。INT8 必须配校准器，见第十节 |
+| python 建引擎报 `invalid device context` | pycuda 只 `cuda.init()` **不会**创建 CUDA 上下文，必须先 `cuda.Device(0).make_context()` 再 push。注意 pycuda 2019.1 **没有** `retain_primary_context`（`Device.__getattr__` 是个兜底转发到 `get_attribute()` 的钩子，访问不存在的名字只抛 `AttributeError`） |
+| python 里没有 `config.set_memory_pool_limit` | Jetson 版 TRT 8.2 的 python 绑定**没有暴露 `MemoryPoolType`**，只能用 `config.max_workspace_size = 2048 << 20`（8.2 里虽标 deprecated 但生效；8.5+ 才移除） |
+| `sudo: nvprof: command not found` / `Error: Encountered invalid option: --loadEngine=` | `sudo` 会重置 PATH → 用绝对路径 `/usr/local/cuda/bin/nvprof`；且**先写被测可执行文件**再写它的参数：`nvprof /usr/src/tensorrt/bin/trtexec --loadEngine=...` |
 
 ---
 
@@ -240,19 +263,92 @@ sudo nice -n -10 ./main 0 config.yaml
 「`depth_launch` 12.8ms 由隐式同步造成」被数据推翻，那 12.8ms 其实是 TRT `enqueueV2`
 逐层发射数百个 kernel 的 CPU 固有开销。
 
-**瓶颈现状与优化上界**：优化后 `infer_pipeline` 占墙钟 **96.4%**，其中 CPU 发射约 20.7ms、
-GPU 执行约 112–115ms。用 `depth_interval: 2` 反推，深度模型占约 85ms GPU、YOLO 约 30–50ms。
+**瓶颈现状**：优化后 `infer_pipeline` 占墙钟 **96.4%**，其中 CPU 发射约 20.7ms、GPU 执行约 128ms
+（`trtexec` 直接实测：YOLO 50.1 + Depth 77.8）。GPU 利用率 ≈99%、帧内无气泡，
+**所以真正的出路只能在 GPU 侧**（模型 / 分辨率 / 精度 / 帧率策略）。
 
-而且可以**只用已有数据证明纯 CPU 侧优化已经到顶**：`p3.yolo_wait` 与 `p5.depth_wait` 都在
-`processOverlap()` 返回前同步了各自的流 → **本帧全部 GPU 工作必须在这 134ms 内跑完**，
-而帧时间 ≥ 每帧 GPU 忙时。所以任何纯 CPU 侧重构的绝对上限是 134ms → 7.46 fps，
-相对当前的 7.219 **最多 +3.4%**。
-
+> **一个必须记住的分析范式**：别凭直觉估「把 CPU 工作藏进 GPU 等待能省多少」，先做归零判断。
+> `p3.yolo_wait` 与 `p5.depth_wait` 都在 `processOverlap()` 返回前同步了各自的流
+> → **本帧全部 GPU 工作都必须落在这 134ms 内**，而帧时间 ≥ 每帧 GPU 忙时。
+> 所以纯 CPU 侧重构的绝对上限是 134ms → 7.46 fps，相对当前 7.219 **最多 +3.4%**。
 > 顺带纠正一个直觉错误：那 20.7ms 的 CPU 发射**早就是被隐藏的**（深度预处理 kernel 一发射
 > GPU 就开工，后面的 `enqueueV2` 都是在 GPU 忙着时做的），并不存在「把发射藏进等待」的收益。
 
-**所以出路只有两条**：① `depth_interval: 2`（改一行配置，业务取舍）；② 转向模型层面
-（更小的 YOLO 输入、更轻的深度模型、降输入帧率）—— 后者需要重新导出 ONNX + 重新校准，属大工程。
+### ⭐ 最大的意外发现：现役引擎是「建坏了」的
+
+**背景**：在得出「INT8 在这张卡上已经到头」之前，我们做了一件本该更早做的事 ——
+**拿原始 ONNX 用最朴素的参数裸重建一遍，跟现役引擎对着测**。结果推翻了结论：
+
+| 同一个 ONNX 建出来的深度引擎 | GPU Compute Time |
+|---|---|
+| 现役 `..._fp16_trt8.2.engine` | **94.32 ms** |
+| 现役 `..._int8_trt8.2.engine` | **77.70 ms** |
+| 裸重建 `--fp16 --workspace=2048` | **78.09 ms** |
+
+**裸 fp16 重建比现役 fp16 引擎快 16.2ms（−17%），直接追平了现役 INT8。**
+最可能的原因是 **`--workspace` 太小**：`trtexec` 的默认 workspace **只有 16MB**，
+TRT 拿不到大 tile / winograd 算法需要的 scratch 显存，只能退到 FP32 sgemm ——
+这正好和 `nvprof` 看到的那一堆 FP32 sgemm 吻合。
+
+> 📌 **通用纪律：拿到一个「已优化」的引擎，第一件事是自己从 ONNX 重建一遍做对照。**
+> 构建参数（workspace / timing cache / tacticSources / 构建机）任何一个不同都可能差 10–20%。
+> 「引擎是别人给的」这件事本身就是一个未经验证的假设。
+>
+> ⚠️ 构建很慢要有耐心：Lite-Mono-Tiny（2.2M 参数）在 Nano 上单次构建 **约 9–10 分钟**；
+> INT8 还要先跑 200 批校准（1.76s/批 ≈ 6 分钟）。多变体扫描请写脚本丢后台跑。
+
+**构建期其它旋钮实测（都是负结论，别重复试）**：
+
+| 变体 | GPU Compute Time | 结论 |
+|---|---|---|
+| 裸重建 `--fp16 --workspace=2048` | 78.09 ms | ✅ 有效 |
+| `--tacticSources=-CUDNN` | 103.65 ms | ❌ 更差（−33%） |
+| `--tacticSources=-CUDNN,-CUBLAS,+CUBLAS_LT` | 105.21 ms | ❌ 更差 |
+| `--directIO` | 78.09 ms | ➖ 与裸重建打平，无增益 |
+| `--int8`（**不给校准数据**） | ≈ fp16 | ❌ 无意义：缺 dynamic range 的层会整体退回 FP16 |
+
+### kernel 级真实成本（`nvprof`，基线构建，单帧）
+
+| 类别 | ms/帧 | 占比 | 次/帧 |
+|---|---|---|---|
+| **FP32 GEMM (sgemm)** | 23.81 | 17.1% | 29 |
+| winograd / cuDNN 卷积 | 22.41 | 16.1% | 32 |
+| TRT pointwise（生成内核） | 20.26 | 14.5% | **98** |
+| 其它 | 18.30 | 13.1% | 63 |
+| `__myl_*`（融合激活 / Norm / gating） | 12.03 | 8.6% | 34 |
+| INT8 layout 转换 | 6.79 | 4.9% | 42 |
+| Reformat / Copy | 6.59 | 4.7% | 21 |
+| grouped / direct 卷积 | 6.44 | 4.6% | 17 |
+| Slice / Concat / Shuffle | 4.81 | 3.5% | 7 |
+| Resize | 3.97 | 2.8% | 7 |
+| 自研 CUDA kernel（letterbox / resize / transpose） | 3.52 | 2.5% | 3 |
+| FP16 GEMM (hgemm) | 3.29 | 2.4% | 10 |
+| Softmax | 2.11 | 1.5% | 1 |
+
+三个可直接读出的结论：
+
+1. **卷积只占约 35%**，别默认「卷积是瓶颈」。
+2. **非数学的图层开销**（pointwise + INT8 layout + reformat + slice + transpose + memcpy）
+   ≈ **43.6 ms/帧 = 31%** —— 这是 ONNX 图形态造成的，不是模型算力需要的。
+3. **29 次/帧的 FP32 GEMM = 23.8ms 全部来自深度模型**（单测深度引擎可复现 29 次 / 23.5ms）。
+   FP16 hgemm 只有 3.0ms → **GEMM 占深度模型的 34%，其中 88% 跑在 FP32 上**。
+   这些 GEMM 来自 Lite-Mono 的注意力 MatMul；`__myl_*` 的 kernel 名字直接写着融合了什么
+   （`...AddDivErfAddMulMul` = Erf 版 GELU、`...MeaSubMulMeaAddSqrDiv...` = LayerNorm），
+   是免费的模型结构情报。
+
+> ⚠️ `nvprof` 的**绝对值**也带仪器开销（本次合计 139.45ms vs 真实 GPU 忙时 127.9ms，约 9% 膨胀），
+> 但**相对占比可用**。要绝对值请以 `trtexec` 的 `GPU Compute Time` 为准。
+
+### `depth_interval: 2` 的完整代价
+
+实测 **7.220 → 10.009 fps（+38.6%，单帧 138.5 → 99.9ms）**。除了「深度更新率减半」，
+还有两处容易被漏掉的语义代价（都在 `pipeline.cpp::processOverlap`）：
+
+1. `updateMotionStates()` **每帧都执行**，非深度帧直接用 `cached_depth_` → 卡尔曼滤波拿到的是
+   **当前帧 `timestamp` + 上一帧 depth 测量值**的错配组合 → 速度/加速度估计有**系统性偏差**，
+   不是单纯「显示慢一帧」。业务若对「趋近 / 远离」判定敏感需单独评估。
+2. `depth_vis` 走的也是 `cached_depth_vis_` → **存出的 jpg 深度半区与 RGB 半区差一帧**。
+
 
 ### 更早的轮次
 
@@ -265,33 +361,108 @@ GPU 执行约 112–115ms。用 `depth_interval: 2` 反推，深度模型占约 
 
 ### 已经确认走不通的方向
 
-- **继续在量化层面抠**：sm_53（Maxwell）在 TRT 8.2 下**没有真正的 INT8 卷积 kernel**，
-  nvprof 显示卷积全部回退 FP16 winograd / FP32 sgemm（FP32 sgemm 合计 ~25–30ms/帧）。
-  这不是配置错误，是架构限制 —— INT8 在这张卡上已经到头。
-- **融合 letterbox + CHW 两个预处理 kernel**：全量 nvprof 统计后，自研 CUDA kernel
-  （letterbox 2.8 + depth resize 1.5 + transpose 1.3 + decode 0.7 + process 0.5 + normlize 0.2）
-  **一共才 ~7.4ms/帧**，融合省不下 2%，不值得动。
-- **把拼接也搬进工作线程**：`depth_vis` 直接包在深度模型的 pinned 主机缓冲上，
-  下一帧深度的 D2H 会覆盖它 —— 搬过去就是数据竞争，必须留在主线程。
+| 想法 | 结论 |
+|---|---|
+| 听信「Nano 没有 Tensor Core，所以 INT8 没用」改用 FP16 | ❌ **反了**：深度 INT8 比 FP16 快 17.5%（77.76 vs 94.30ms）。这句话结论对、理由不成立，见下方注解 |
+| **DLA 卸载**（官方文档的常规建议） | ❌ Jetson Nano / Tegra X1 **没有 DLA**（Xavier 起才有） |
+| TF32 / 结构化稀疏 `--sparsity` / `--builderOptimizationLevel` | ❌ Maxwell 不支持 TF32；稀疏需 Ampere+；`builderOptimizationLevel` 要 TRT 8.6+（板上是 8.2） |
+| **CUDA Graphs** 消掉 20.7ms 发射 | ❌ **已实测否决**：`--useCudaGraph` 19.771 vs 19.735 qps = **+0.2%**，独立验证了 +3.4% 上界 |
+| 软件流水：拆 `launch(N)` / `collect(N-1)` | ❌ 上界只有 +3.4%，且前提就错了（发射早被隐藏，见上文的归零判断） |
+| legacy default stream 耦合导致 `depth_launch` 12.8ms | ❌ 已实测：改非阻塞流后仍是 12.8ms |
+| 融合 letterbox + CHW 预处理 kernel | ❌ 自研 kernel **全量**才 7.4ms/帧（letterbox 2.8 + depth resize 1.5 + transpose 1.3 + decode 0.7 + process 0.5 + normalize 0.2），天花板 <2% |
+| 把拼接搬进工作线程 | ❌ `depth_vis` 直接包在深度模型的 pinned 主机缓冲上，下一帧深度的 D2H 会覆盖它 —— 数据竞争，必须留在主线程 |
+| `04.concat` 用 3 槽环形预分配 buffer | ⚠️ 槽数不够（需 ≥4）、必须按引用计数回收，收益仅 ~3ms，且保存图会撕裂，不划算 |
+| `--tacticSources` 调 cuDNN / cuBLAS 选型 | ❌ 实测**更差**：103.7 / 105.2ms（对照 78.1ms） |
+| `--directIO` | ➖ 78.09ms，与裸重建打平，无增益 |
+| `--useSpinWait` | ⚠️ 未试。理论只省 CPU 侧事件同步延迟，量级 <1ms |
+| 「`/model.22/dfl/conv/Conv` 占了 YOLO 一半算力」去重构检测头 | ❌ 那是逐层表的**归因伪影**，真实不存在，见「常见问题」 |
+
+> **「Nano 上 INT8 没用」这句话结论对、理由不成立。** 官方论坛常答「INT8 需要 Tensor Core（sm>7.x），
+> Nano 请用 FP16/FP32」。Maxwell（sm_53）确实**没有 Tensor Core 也没有 DP4A**，但 TRT 8.2 仍会
+> 发射 INT8 kernel —— 省的是**内存带宽**（权重/激活 4× 变小），带宽型网络直接受益。
+> **所以：先量 INT8/FP16/FP32 三档（各一份 engine 往往已经躺在 `model/engine/` 里），按实测选，别按说法选。**
 
 ### 待做 / 候选方向
 
-- [ ] `depth_interval: 2`：**当前唯一有意义的杠杆**。旧数字 10.42 fps 是「管线口径 + Round 1 之前的
-      旧构建」，不能直接和现在的「端到端 7.219」比，**必须先在当前构建上实测端到端 fps**。
-      代价是深度更新率减半（需业务侧确认精度，注意 `motion_state_engine` 用深度算速度/加速度）
-- [ ] 模型层面（唯一能突破 +3.4% 上界的方向）：减小 YOLO 输入分辨率（640→512/416）、换更轻的深度模型、
-      降输入帧率。都需从 .pt 重新导出 ONNX 并重新校准，属跨轮次大工程
-- [ ] CUDA Graphs：静态形状已满足（`1×3×640×640` / `1×3×192×640`），
-      把整条 enqueue 链捕获成一张图回放。**但同受 +3.4% 上界约束**，只有当实测 GPU 忙时
-      明显低于 134ms（帧内有可观气泡）时才值得做
-- [ ] 减小 YOLO 输入分辨率（640→512/416）：需从 .pt 重新导出 ONNX（板上只有固定 640 的 ONNX，
-      直接改图会破坏 neck 里 Resize 的常数尺度）
-- [ ] Depth 模型 `naiveSlice` kernel ~4.8ms/帧（TRT 内部切片 op，需改模型导出才能消除）
+- [ ] **重建引擎（当前性价比最高的下一步）**：现役引擎的 workspace 很可能只有 16MB ——
+      裸重建 fp16 就已经 −17%。用 `scripts/build_engine.py` 显式 `--workspace=2048` +
+      校准数据重建 INT8 即可，**不需要改模型、不需要改一行 C++**。构建方法见第十节，
+      ⚠️ 交付前必须用业务数据重新校准
+- [ ] **`depth_interval: 2`**：已实测 **+38.6%**（7.219 → 10.009 fps），与粗估只差 1%。
+      代码与配置都已支持，**卡在业务确认**（三处语义代价见上文）
+- [ ] **换更轻的深度模型**（唯一能突破量级的方向）：Lite-Mono-Tiny 实测 77.8ms；
+      论文里 RT-MonoDepth-S 在同板同分辨率可跑 30.5 FPS（≈32.8ms），约 **2.4×**。
+      但需从 `.pt` 重新导出 ONNX + 重新校准 + 业务精度验证 —— 板上与 PC 上都没有
+      torch / ultralytics，**当前无法重导 ONNX**（得先解决这个前置条件）
+- [ ] **减小 YOLO 输入分辨率**（640→512/416）：社区实测 Nano 上 320² ≈42 FPS vs 640² ≈18 FPS；
+      本项目 YOLO 占 50.1ms，预期能压到 12–21ms。同样需要重导 ONNX
+      （板上只有固定 640 的 ONNX，直接改图会破坏 neck 里 Resize 的常数尺度），且小目标会退化
+- [ ] 深度模型的 3 个 `{ForeignNode[...]}` 打包节点 + 29 次 FP32 GEMM（23.8ms，占深度 34%）——
+      来自 Lite-Mono 的注意力 MatMul，**要动只能改模型结构**
+- [ ] 深度模型 `naiveSlice` kernel ~4.8ms/帧（TRT 内部切片 op，需改模型导出才能消除）
 - [ ] 引擎反序列化 / 启动加速：冷启动 24.9s 里第一个引擎独占 24.1s，说明大头是
       CUDA/TensorRT 运行时的一次性装载，而非反序列化本身。顺带清理死代码：
       `/dev/shm` 引擎缓存**只写不读**（`loadEngineFromShm()` 从未被调用，写入本身也失败）
-- [ ] `main` 的 RUNPATH 由绝对路径改为 `$ORIGIN`
+- [ ] `main` 的 RUNPATH 由绝对路径改为 `$ORIGIN` —— 否则任何 A/B 都活在「加载错库」的阴影里
 - [ ] 报警上报 JSON 轻量化（剥离 JsonSender 或改共享内存）
+
+---
+
+## 十、重建引擎（含 INT8 校准）
+
+仓库里预置了引擎，但**只要你想改构建参数、或想验证「现役引擎是不是建好的」，就得自己重建**。
+`scripts/build_engine.py` 用纯 TensorRT Python API 在板上直接把 ONNX 转成 engine
+（不需要 torch / ultralytics，Jetson 上原生可跑）。
+
+**为什么不能用 `trtexec` 建 INT8**：`trtexec` 的 `--calib` 只接受**已有的校准缓存文件**，
+不支持从图片/视频校准，而本仓库没有校准缓存 —— 所以 INT8 重建必须自带校准器。
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/calib_precheck.py` | 建之前先跑（≈40s）：验证 CUDA 上下文 / 抽帧归一化 / ONNX 解析 / workspace API |
+| `scripts/build_engine.py` | 从 ONNX 建 engine（INT8 自带熵校准器 + 校准缓存复用） |
+| `scripts/verify_new_engine.sh` | 把新引擎接进 app 跑端到端 A/B，**跑完自动还原**现役引擎 |
+| `scripts/compare_engines.py` | 精度体检：同一批输入喂两个 engine，输出 MAE / max\|Δ\| |
+
+```bash
+# 0) 预检（约 40s）：验证 CUDA 上下文 / 抽帧归一化 / ONNX 解析 / workspace API
+python3 scripts/calib_precheck.py
+
+# 1) 首次构建 INT8：抽 200 帧校准（≈6 分钟）+ 构建（≈9 分钟），并写出校准缓存
+python3 scripts/build_engine.py \
+    --onnx model/onnx/lite-mono-tiny/lite-mono-tiny_192x640_op11.onnx \
+    --out  /tmp/lm_int8.engine \
+    --precision int8 --workspace 2048 \
+    --calib-video /path/to/your.mp4 --calib-frames 200 \
+    --calib-cache lm.cache
+
+# 2) 之后复用缓存重建（跳过校准，只花构建时间）
+python3 scripts/build_engine.py \
+    --onnx model/onnx/lite-mono-tiny/lite-mono-tiny_192x640_op11.onnx \
+    --out  /tmp/lm_int8.engine \
+    --precision int8 --workspace 2048 --calib-cache lm.cache
+
+# 3) 实测（务必与现役引擎在**同一会话**里对照，跨会话的时钟漂移会骗人）
+/usr/src/tensorrt/bin/trtexec --loadEngine=/tmp/lm_int8.engine \
+    --iterations=50 --warmUp=500 --avgRuns=20 | grep -E 'Throughput|GPU Compute Time'
+
+# 4) 接进 app 跑端到端 A/B（自动备份/还原现役引擎）+ 精度体检
+bash scripts/verify_new_engine.sh /tmp/lm_int8.engine
+python3 scripts/compare_engines.py --video /path/to/x.mp4 --frames 20 \
+    --engines 现役=model/engine/lite-mono-tiny/lite-mono-tiny_192x640_op11_int8_trt8.2.engine \
+               新=/tmp/lm_int8.engine
+```
+
+三条硬约束（都是踩过的坑）：
+
+1. **`--workspace` 必须显式给**。`trtexec` 默认只有 **16MB**，TRT 拿不到大 tile 的 scratch 显存
+   就会退到 FP32 sgemm —— 实测同一份 ONNX 差 **17%**（94.32 → 78.09ms）。
+2. **校准归一化必须与 app 一致**。深度模型走 `depth_model.cpp` 的 `is_normalize=false` 分支，
+   预处理 kernel 是 `(val/255 - mean)/std` 且 mean=0、std=1 → 校准输入应落在 **[0,1]**，
+   **不是** ImageNet 的 0.45/0.225。脚本默认值已是 0/1，预检会打印实际数值范围供核对。
+3. **交付前必须用业务真实场景数据重新校准**。拿测试视频校准只够验证**性能**，INT8 精度没有保证。
+
+> ⚠️ `model/engine/` 已被 `.gitignore` 排除，重建产物请自行留档，不要指望它进仓库。
 
 ---
 

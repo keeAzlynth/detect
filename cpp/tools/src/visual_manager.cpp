@@ -189,12 +189,11 @@ DrawingManager::DrawingManager(const std::vector<std::string> & class_names) :
     vClassNames_(class_names) {}
 
 void DrawingManager::drawTrackedObject(cv::Mat &            img,
-                                       const STrack &       track,
-                                       const AlertMessage & alert_msg,
-                                       cv::Scalar           color) {
-    const std::vector<float> & tlwh     = track.tlwh_;
-    int                        class_id = track.class_id_;
-    int                        track_id = track.track_id_;
+                                       const DrawTarget &   target,
+                                       const AlertMessage & alert_msg) {
+    const int  class_id = target.class_id;
+    const int  track_id = target.track_id;
+    cv::Scalar color    = target.color;  // 局部副本：危险目标会被改成红色
 
     // 准备文字标签
     std::string label = cv::format("%s #%d", vClassNames_[class_id].c_str(), track_id);
@@ -202,8 +201,9 @@ void DrawingManager::drawTrackedObject(cv::Mat &            img,
     // 绘制文字背景框和文字
     int      baseLine   = 0;
     cv::Size label_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, &baseLine);
-    cv::Rect rect_bg(cv::Point((int) tlwh[0], (int) tlwh[1] - label_size.height - 8),
-                     cv::Size(label_size.width + 8, label_size.height + 8));
+    cv::Rect rect_bg(
+        cv::Point((int) target.tlwh[0], (int) target.tlwh[1] - label_size.height - 8),
+        cv::Size(label_size.width + 8, label_size.height + 8));
 
     // 绘制目标主体矩形框
     // 检查物体是否危险
@@ -215,10 +215,10 @@ void DrawingManager::drawTrackedObject(cv::Mat &            img,
         }
     }
 
-    int x1 = static_cast<int>(tlwh[0]);
-    int y1 = static_cast<int>(tlwh[1]);
-    int x2 = static_cast<int>(tlwh[0] + tlwh[2]);
-    int y2 = static_cast<int>(tlwh[1] + tlwh[3]);
+    int x1 = static_cast<int>(target.tlwh[0]);
+    int y1 = static_cast<int>(target.tlwh[1]);
+    int x2 = static_cast<int>(target.tlwh[0] + target.tlwh[2]);
+    int y2 = static_cast<int>(target.tlwh[1] + target.tlwh[3]);
 
     // 裁剪到图像范围内，防止 ROI 越界
     x1 = std::max(0, std::min(x1, img.cols - 1));
@@ -240,7 +240,7 @@ void DrawingManager::drawTrackedObject(cv::Mat &            img,
     }
     cv::rectangle(img, cv::Rect(x1, y1, w, h), color, 2);
     cv::rectangle(img, rect_bg, color, cv::FILLED);
-    cv::putText(img, label, cv::Point((int) tlwh[0] + 4, (int) tlwh[1] - 4),
+    cv::putText(img, label, cv::Point((int) target.tlwh[0] + 4, (int) target.tlwh[1] - 4),
                 cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
 }
 

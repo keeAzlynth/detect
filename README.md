@@ -12,7 +12,8 @@ YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT INT8 引擎加速（FP1
 - **双模型推理**：YOLOv8n 目标检测 + Lite-Mono-Tiny 单目深度估计，TensorRT 8.2 INT8 引擎（FP16/FP32 保留备用）
 - **纯 GPU 管线**：CUDA 预处理（letterbox/归一化）+ CUDA 后处理（NMS），`--use_fast_math`
 - **目标跟踪**：ByteTrack + 卡尔曼滤波，支持目标运动状态（趋近/远离/加减速）判断
-- **异步重叠**：`overlap: true` 时读帧线程与主循环重叠；YOLO 与 Depth 通过各自 CUDA 流真并行（Depth 先发车，YOLO 等待/跟踪期间 Depth 持续计算）
+- **异步重叠**：`overlap: true` 时读帧线程与主循环重叠；YOLO 与 Depth 各跑自己的 CUDA 流
+- **绘图/落盘不占关键路径**：`DrawSaveWorker` 独立线程负责逐目标绘制与 JPEG 编码写盘，与下一帧的 GPU 推理重叠
 - **零分配稳态**：单 `Pipeline` 实例 + 2 槽位帧缓冲池循环复用，稳态无每帧 `cudaMalloc`/`cudaFree`；首帧预热在进入主循环前完成
 - **报警机制**：危险目标（距离变化）自动生成 AlertMessage，支持 TCP 上报
 - **多输入**：H.264 视频文件 / USB 摄像头（`/dev/video0`）两种输入
@@ -20,14 +21,26 @@ YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT INT8 引擎加速（FP1
 
 ### 实测性能（Jetson Nano, MAXN 锁频）
 
-| 场景 | 结果 |
+主循环每 100 帧打印两个口径，**看优化效果必须看后者**：
+
+- **推理管线 fps** —— 只统计 `processOverlap()`，是历史基准口径，不含读帧/绘图/落盘
+- **墙钟 fps** —— 端到端真实吞吐，含读帧等待、绘图、落盘的重叠情况
+
+| 场景 | 推理管线 fps | 端到端 fps |
+|---|---|---|
+| 视频文件 (1shu_east_0514.mp4, 30fps)，INT8 双引擎 | 7.47（单帧 135ms） | **7.22（单帧 138.5ms）** |
+| USB 摄像头 640×360，INT8 双引擎 | 7.60 | 7.1–7.5 |
+| 深度隔帧 `depth_interval: 2`（INT8） | — | **10.42**，深度更新率减半，待业务侧确认 |
+| FP16 双引擎（量化改造前的对照，管线口径） | 6.53（单帧 153ms） | — |
+
+> 同一个 INT8 版本，管线口径 7.40 而端到端只有 6.58 —— 那 17ms 差在主循环里画框和压 JPEG，
+> 期间 GPU 是空转的。这是 2026-09-16 那轮优化解决的事，见第九节。
+
+| 项 | 结果 |
 |---|---|
-| 视频文件 (1shu_east_0514.mp4, 30fps)，**INT8 双引擎** | **7.40 fps**（单帧推理 ~135ms），1000 帧稳态波动 ≤0.01（2026-09-05） |
-| 深度隔帧 `depth_interval: 2`（INT8） | **10.42 fps**，深度更新率减半，待业务确认后可启用 |
-| FP16 双引擎（对照） | 6.53 fps（单帧推理 ~153ms） |
-| USB 摄像头 | 未单独基准（GPU 工作量与视频模式相同，预期同量级） |
-| 启动 | ~24s（反序列化 2 个引擎）；首帧 TRT/cuDNN 自动调优已由预热吸收，主循环第一帧即稳态 |
+| 启动 | 冷启动 **~25s**（清页缓存实测：日志起 → 两个引擎就绪 24.9s。其中**第一个引擎独占 24.1s**，第二个只 0.8s —— 主要是 CUDA/TensorRT 运行时装载 + 上下文创建的一次性开销，不是"反序列化两个引擎"）；页缓存热时 ~7s |
 | 内存 | 4GB 板上无换页抖动 |
+| 退出 | 收尾偏慢（`cuModuleUnload` ×594 ≈ 2.6s），不影响稳态帧率 |
 
 > 历史问题（commit 469f09b 已修）：更早版本 `main.cpp` 与 `AsyncPipeline` 各自隐式加载一份
 > Pipeline（4 次引擎反序列化、显存翻倍），在 4GB 板上触发换页抖动导致阶段耗时 7~85ms 剧烈波动。
@@ -54,13 +67,14 @@ YOLOv8n 检测 + Lite-Mono 单目深度估计，TensorRT INT8 引擎加速（FP1
 ```
 depth-detect-turbo/
 ├── cpp/
-│   ├── main.cpp                  # 主程序（读帧→推理→绘图→保存）
+│   ├── main.cpp                  # 主程序（读帧→推理→拼接→交给工作线程绘制/落盘）
 │   ├── core/                     # 流水线核心（Pipeline、IO、报警、运动状态）
 │   ├── inference/                # 推理后端(TensorRT/ONNXRuntime) + 模型封装
 │   ├── bytetrack/                # ByteTrack 目标跟踪
 │   ├── op_kernel/                # CUDA 预处理/后处理 kernel
-│   ├── tools/                    # 绘制(FPS/检测框) + 计时
-│   └── utils/                    # 配置加载 + 日志
+│   ├── tools/                    # 绘制(FPS/检测框) + DrawSaveWorker(绘制/落盘线程) + 计时
+│   └── utils/                    # 配置加载 + 日志 + prof_stats(热点探针)
+├── docs/                         # 优化报告
 ├── model/
 │   ├── engine/                   # 已导出的 INT8/FP16/FP32 TRT 引擎
 │   └── onnx/                     # ONNX 回退模型
@@ -90,14 +104,21 @@ cmake --build . -- -j4  # 并行编译（老 cmake 需用 `--` 传 -j，或直�
 ```bash
 cmake -DENABLE_TIMER=OFF ..                 # 关闭逐阶段计时统计
 cmake -DPIPELINE_PHASE_TIMER=ON ..          # 开启 pipeline 内每阶段 [TIMER] 打印（默认关，零开销）
+cmake -DENABLE_PROF_STATS=ON ..             # 开启逐阶段热点探针，退出时打印 avg/max/占比（默认关，零开销）
 cmake -DENABLE_JESTON_MEM_MANAGED=ON ..     # Jetson 统一内存（实验性）
 cmake -DTARGET_CUDA_ARCHS=53 ..             # 手动指定 CUDA 架构
 cmake -DCMAKE_BUILD_TYPE=Debug ..           # 调试构建
 ```
 
-产物输出到 `bin/`（`main` + 各动态库 `lib*.so`），已放在同一目录，运行时无需额外设置 `LD_LIBRARY_PATH`。
+产物输出到 `bin/`（`main` + 各动态库 `lib*.so`）。
 
-> 提示：`cmake --build .` 串行可能较慢，建议追加 `-- -j4`。
+> ⚠️ **4GB 板上编译务必限制并行度与单进程内存**，否则 cc1plus 打满内存会让整机换页卡死：
+> ```bash
+> ulimit -v 2621440 && make -j2      # 2.5GB 上限；free -m 里 available < 3000 时用 -j1/-j2
+> ```
+
+> ⚠️ **`main` 的 RUNPATH 是绝对路径 `bin/`**。想把二进制拷到别处跑 A/B，必须
+> `export LD_LIBRARY_PATH=<那个目录>` 顶到最前面，否则会静默加载 `bin/` 里的另一份 `libcore/libtools`。
 
 ---
 
@@ -107,10 +128,8 @@ cmake -DCMAKE_BUILD_TYPE=Debug ..           # 调试构建
 
 ```bash
 cd ~/depth-detect-turbo/bin
-# 先开启性能模式（可选但推荐，自动 sudo）
-./perf.sh
-# 运行：第一个参数 0 表示摄像头设备号
-./main 0 config.yaml
+./perf.sh                 # 开启性能模式（可选但推荐，自动 sudo）
+./main 0 config.yaml      # 第一个参数 0 表示摄像头设备号
 ```
 
 ### 5.2 跑视频文件
@@ -128,7 +147,7 @@ cd ~/depth-detect-turbo/bin
 | `任意路径.mp4` | 视频文件路径 |
 | `config.yaml` | 配置文件路径 |
 
-处理结果（检测框 + 深度图逐帧拼接图）保存到 `bin/out_dir/`。
+处理结果（检测框 + 深度图逐帧拼接图，高度是原图两倍）保存到 `bin/out_dir/`。
 
 日志默认同时输出到控制台与 `bin/latest.log`，每 100 帧打印一次当前 FPS。
 
@@ -168,10 +187,14 @@ sudo nice -n -10 ./main 0 config.yaml
 | `display_manager.is_display` | `false` | true = 实时窗口（需接 HDMI/VNC） |
 | `prefer.use_gpu` | `true` | true = TensorRT GPU，false = ONNX CPU（很慢） |
 | `prefer.overlap` | `true` | true = 异步重叠流水线 |
-| `depth.depth_interval` | `1` | 隔帧做深度推理的间隔（调大省算力） |
+| `depth.depth_interval` | `1` | 隔帧做深度推理的间隔（调大省算力，见第九节） |
 | `io_manager.save_mode` | `images` | images / video / both / none |
 | `io_manager.send_tcp` | `false` | 是否 TCP 上报报警数据 |
 | `logger.log_level` | `debug` | trace / debug / info / warn / err |
+
+> ⚠️ `log_level` 一定要保留 `info` 或更低。主循环那句
+> `Processing frame N (x fps pipeline, y fps wall)` 是 info 级别，
+> 设成 `warn` 会把唯一的帧率读数一起吞掉。
 
 ---
 
@@ -181,70 +204,81 @@ sudo nice -n -10 ./main 0 config.yaml
 |---|---|
 | `Failed to open video: 0` | 程序内置支持纯数字设备号走 `/dev/video0`；确认 USB 摄像头已插、`ls /dev/video*` 可见 |
 | `cmake: CMAKE_CUDA_COMPILER could not be found` | 本新版 CMakeLists 会自动找 nvcc；若仍失败，`sudo apt install nvidia-cuda-toolkit` 或用 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc` |
-| 启动慢（约20s+） | 正常：需反序列化 2 个 TRT 引擎（~24s）；首帧自动调优已由预热吸收，主循环首帧即稳态 |
-| `VIDEOIO ERROR: V4L2: property frame_count is not supported` | 正常：摄像头无帧总数属性，不影响运行 |
+| 启动要等二十几秒 | 正常：冷启动约 25s，绝大部分是 CUDA/TensorRT 运行时装载 + 上下文创建的一次性开销（第一个引擎就占 24s，第二个只 0.8s），页缓存热了之后约 7s。首帧自动调优已由预热吸收，主循环首帧即稳态 |
+| `VIDEOIO ERROR: V4L2: property frame_count is not supported` | 正常：摄像头没有帧总数属性，不影响运行 |
+| `Cannot open shared memory file: /dev/shm/trt_engine_*.cache` | 正常：`saveEngineToShm()` 写缓存失败，而 `loadEngineFromShm()` 根本没被调用，属死代码，不影响运行 |
+| 编译到一半整机卡死 | 4GB 板内存打满触发换页。见第四节：`ulimit -v 2621440` + 低 `-j` |
 | pip 装包 ProxyError | 板子走代理时用 `env -u http_proxy -u https_proxy ...` 绕开 |
 
 ---
 
 ## 九、性能优化记录与方向
 
-已完成（2026-08-28，commit 469f09b）：
+### 当前状态（2026-09-16）
 
-- [x] 单 `Pipeline` 实例：`AsyncPipeline` 改持外部引用，消除双份引擎加载（启动/显存减半）
-- [x] 2 槽位帧缓冲池：稳态零 `cudaMalloc`/`cudaFree`（后者隐式同步全设备，是隐性停顿点）
-- [x] YOLO/Depth 双 CUDA 流真重叠：Depth 先异步发车，与 YOLO 等待/跟踪期并行
-- [x] 首帧预热：TRT/cuDNN 首帧 ~35s 自动调优移出主循环
-- [x] 深度缓存 swap 顺序修复：运动状态判定不再拿到空深度图
-- [x] `BaseModel` 输出指针表 static → 实例成员（消除多实例互踩隐患）
-- [x] letterbox 常量真正复用 + 乘倒数替代除法；`cv::Mat` 热路径传参改 `const &`
-- [x] `PhaseTimer` 编译期开关（`-DPIPELINE_PHASE_TIMER=ON` 可开，默认零开销）
+锁频（MAXN + jetson_clocks，CPU 1479MHz）+ 固定 300 帧素材，生产配置：
 
-已完成（2026-09-05，本轮，6.53 → 7.40 fps / +13%）：
+| 版本 | 单帧墙钟 | 端到端 fps | 推理管线 fps |
+|---|---|---|---|
+| 基线 `77659e3` | 152.05 ms | 6.577 | 7.40 |
+| **本轮** | **138.53 ms** | **7.219（+9.8%）** | 7.47 |
 
-- [x] **INT8 引擎落地**：YOLOv8n + Lite-Mono-Tiny 双模型 INT8（熵校准 370 帧），应用内 6.53 → 7.40 fps
-      （1000 帧稳态）。检测框与深度伪彩视觉验证与 FP16 无可感知差异（同帧对比）。
-      ⚠️ 实测结论：Maxwell（sm_53）在 TRT 8.2 下**没有真正的 INT8 卷积 kernel**——nvprof 显示卷积
-      全部回退 FP16 winograd / FP32 sgemm（`cuInt8::nchwToNchhw2` 只有量化搬运），收益来自
-      逐层策略重选：YOLO +4%、Depth +17%（trtexec 单测），应用内合计 +13%。INT8 在本卡上已到头，
-      进一步提速只能减少 GPU 工作量（见待做）。
-- [x] **读帧 H2D 改 pinned 暂存**（`frame.h` / `io_manager.cpp`）：pageable 内存直接
-      `cudaMemcpyAsync` 会触发驱动隐式设备同步，与主循环 TRT enqueueV2 相撞，把 kernel
-      发射拖大 4 倍（Depth 发射实测 49ms → 12ms，trtexec 单测 11.4ms）。
-      注：该 CPU 停顿此前被 GPU 饱和掩盖，对帧率无直接影响，但消除了 p90 抖动源。
-- [x] **修复落盘缺深度半区 bug**（`pipeline.cpp`）：`process/processOverlap` 末尾用 swap 把
-      `depth_vis` 换入缓存，导致主循环绘图/落盘拿到空 Mat——`depth_interval=1` 时每帧存出的
-      图都只有上半原图（1280x720 而非设计的 1280x1440 拼接图）。改为 Mat 浅拷贝缓存（仍零像素拷贝）。
-- [x] INT8 校准工具链：`~/build_int8.py`（pycuda + IInt8EntropyCalibrator2），
-      校准缓存保留在 `~/trt_int8/`（重建引擎免重校准），引擎已装入
-      `model/engine/*/`（gitignore 不入库）。校准图已清理（370 帧，49MB），
-      需重新校准时从任意测试视频一键重抽：
-      `ffmpeg -i <视频> -vf select='not(mod(n,7))' -vsync vfr -q:v 2 ~/calib_int8/img_%04d.jpg`
-- [x] 性能分析方法论：trtexec 单引擎基线 + nvprof 逐 kernel 分解 + tegrastats。
-      帧时间 ≈ 两模型 GPU 时间之和（双流在饱和 GPU 上无真并行），该结论已实测闭环。
+完整数据、kernel 级分解、负结论与复现步骤见
+[`docs/性能优化报告-2026-09-16.md`](docs/性能优化报告-2026-09-16.md)。
 
-本轮问题记录（2026-09-05，均与代码/性能直接相关）：
+**热点在哪**：主循环里「逐目标绘制 7.16ms + JPEG 编码落盘 10.05ms」是纯 CPU 串行，
+这 17.2ms 里 GPU 完全空转 —— 就是「单帧 152ms 而推理只占 135ms」的缺口。
 
-- **pageable 内存 H2D 隐式设备同步**（已修）：读帧线程直接 `cudaMemcpyAsync(pageable→device)`
-  会与主循环 TRT enqueueV2 相撞，kernel 发射拖大 4 倍（Depth 发射实测 49ms vs trtexec 11.4ms，
-  p90 46ms 双峰）。已改 pinned 暂存；该 CPU 停顿此前被 GPU 饱和掩盖，对帧率无直接影响。
-- **swap 缓存清空 depth_vis**（已修）：上一轮 swap 零拷贝缓存把 `depth_vis` 从 context 换走，
-  落盘图长期缺深度半区（1280x720 ≠ 设计的 1280x1440）。教训：对"零拷贝优化"要用输出物验证，
-  对比落盘图片尺寸即可发现。
-- **sm_53 的 INT8 架构限制**（已实测闭环）：INT8 引擎能建能跑，但无 INT8 卷积 kernel，卷积全部
-  回退 FP16/FP32。校准工具链保留（`~/build_int8.py` + `~/trt_int8/*cache`），不要再期待量化层面
-  的进一步收益。
-- **遗留问题**：应用收尾退出偏慢（teardown 阶段 cuModuleUnload ×594 ≈ 2.6s + cudaFree），
-  不影响稳态帧率；启动 ~24s 引擎反序列化仍是待做项。
+**怎么改的**：新增 `DrawSaveWorker`（有界队列容量 2 + 独立线程）把这两件事挪出主循环，
+与下一帧的 GPU 推理重叠；主线程只留拼接（4.7ms）与入队（0.06ms）。
+显示走 `promise<void>` 信号 —— 工作线程画完立刻唤醒主线程 `imshow`，JPEG 编码继续在后台跑。
+验证方式是开/关落盘两个配置的耗时完全重合（改前差 10.25ms，改后差 0.1%）。
 
-待做 / 候选方向：
+**顺带拆掉的一个隐患**：`io_manager` 的读帧 H2D 原先不传 stream，走 legacy default stream，
+而模型流是 `cudaStreamCreate` 出来的 blocking stream —— 按 CUDA 语义两者会互相插入隐式依赖。
+已全部改为 `cudaStreamNonBlocking`。**但实测只快了 0.8%**：原先怀疑的
+「`depth_launch` 12.8ms 由隐式同步造成」被数据推翻，那 12.8ms 其实是 TRT `enqueueV2`
+逐层发射数百个 kernel 的 CPU 固有开销。
 
-- [ ] `depth_interval: 2`：深度隔帧，INT8 后**实测 10.42 fps**，代价是深度更新率减半（需业务侧确认精度）
+**瓶颈现状**：优化后 `infer_pipeline` 占墙钟 **96.4%**，其中 CPU 发射约 20.7ms、
+GPU 执行约 112–115ms。用 `depth_interval: 2`（10.42 fps）反推，深度模型占约 85ms GPU、
+YOLO 约 30–50ms —— **GPU 才是瓶颈，CPU 侧基本榨干了**。
+
+### 更早的轮次
+
+- **2026-09-05（`ebf5077`，管线口径 6.53 → 7.40 fps）**：INT8 双引擎落地（熵校准 370 帧，
+  与 FP16 视觉无可感知差异）；读帧 H2D 改 pinned 暂存，消掉 pageable 拷贝触发的驱动隐式设备同步
+  （Depth 发射 49ms → 12ms）；修掉落盘缺深度半区 bug（之前用 swap 把 `depth_vis` 从 context 换走，
+  存出的图只有上半原图，1280×720 而不是设计的 1280×1440）。
+- **2026-08-28（`469f09b`，6.54 fps）**：单 `Pipeline` 实例消除双份引擎加载；2 槽位帧缓冲池；
+  YOLO/Depth 双 CUDA 流；首帧预热；`BaseModel` 输出指针表 static 改实例成员；letterbox 常量复用。
+
+### 已经确认走不通的方向
+
+- **继续在量化层面抠**：sm_53（Maxwell）在 TRT 8.2 下**没有真正的 INT8 卷积 kernel**，
+  nvprof 显示卷积全部回退 FP16 winograd / FP32 sgemm（FP32 sgemm 合计 ~25–30ms/帧）。
+  这不是配置错误，是架构限制 —— INT8 在这张卡上已经到头。
+- **融合 letterbox + CHW 两个预处理 kernel**：全量 nvprof 统计后，自研 CUDA kernel
+  （letterbox 2.8 + depth resize 1.5 + transpose 1.3 + decode 0.7 + process 0.5 + normlize 0.2）
+  **一共才 ~7.4ms/帧**，融合省不下 2%，不值得动。
+- **把拼接也搬进工作线程**：`depth_vis` 直接包在深度模型的 pinned 主机缓冲上，
+  下一帧深度的 D2H 会覆盖它 —— 搬过去就是数据竞争，必须留在主线程。
+
+### 待做 / 候选方向
+
+- [ ] `depth_interval: 2`：**实测 10.42 fps**，代价是深度更新率减半（需业务侧确认精度）。
+      配置项已存在，改一行即可
+- [ ] 软件流水：把 `processOverlap()` 拆成 `launch(N)` / `collect(N-1)`，并给两个模型各配双缓冲 I/O，
+      把 20.7ms 的 CPU 发射藏进 112ms 的 GPU 等待里。天花板最高，但改动面大（跨帧状态要按帧号重排）
+- [ ] CUDA Graphs：静态形状已满足（`1×3×640×640` / `1×3×192×640`），
+      把整条 enqueue 链捕获成一张图回放，理论上能消掉那 20.7ms；需处理固定 I/O 指针的约束
 - [ ] 减小 YOLO 输入分辨率（640→512/416）：需从 .pt 重新导出 ONNX（板上只有固定 640 的 ONNX，
       直接改图会破坏 neck 里 Resize 的常数尺度）
-- [ ] YOLO letterbox 双 kernel 融合（letterbox+CHW 各写一遍 640x640，nvprof 实测 letterbox 2.8ms/帧）
-- [ ] Depth 模型 `naiveSlice` kernel ~4.8ms/帧（模型结构决定的切片 op，需改模型导出才能消除）
-- [ ] 引擎反序列化加速（当前 `/dev/shm` 缓存只写不读，反序列化本身仍是启动 ~24s 的主体）
+- [ ] Depth 模型 `naiveSlice` kernel ~4.8ms/帧（TRT 内部切片 op，需改模型导出才能消除）
+- [ ] 引擎反序列化 / 启动加速：冷启动 24.9s 里第一个引擎独占 24.1s，说明大头是
+      CUDA/TensorRT 运行时的一次性装载，而非反序列化本身。顺带清理死代码：
+      `/dev/shm` 引擎缓存**只写不读**（`loadEngineFromShm()` 从未被调用，写入本身也失败）
+- [ ] `main` 的 RUNPATH 由绝对路径改为 `$ORIGIN`
 - [ ] 报警上报 JSON 轻量化（剥离 JsonSender 或改共享内存）
 
 ---

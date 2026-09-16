@@ -10,7 +10,7 @@ bin/main
 bin/server_test
 bin/JsonSenderTest
 bin/test_*
-bin/out_dir/
+bin/out_dir*/
 bin/logs/
 bin/*.log
 

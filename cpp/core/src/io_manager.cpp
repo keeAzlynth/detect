@@ -82,6 +82,11 @@ IOManager::~IOManager() {
         video_writer_.release();
     }
     closeVideoSource();
+    // 读帧线程（AsyncPipeline）已先于本对象析构并 join，此处不会有并发使用
+    if (h2d_stream_ != nullptr) {
+        cudaStreamDestroy(h2d_stream_);
+        h2d_stream_ = nullptr;
+    }
 }
 
 void IOManager::saveFrame(const cv::Mat & frame, int num_frames) {
@@ -198,11 +203,22 @@ bool IOManager::readNextFrame(FrameInputContext & frame_input_context, bool simu
         // 先 CPU 拷入 pinned 暂存，再从 pinned 发起异步 DMA。
         // 直接对 pageable 源内存做 cudaMemcpyAsync 时驱动会先做一次隐式设备同步，
         // 与主循环正在进行的 TRT enqueueV2 串行，导致 kernel 发射耗时成倍膨胀。
+        if (h2d_stream_ == nullptr) {
+            // 非阻塞流：不参与 legacy default stream 的隐式同步，
+            // 从而与 Depth/YOLO 的 blocking 推理流彻底解耦（见 io_manager.h 说明）
+            CHECK_CUDA(cudaStreamCreateWithFlags(&h2d_stream_, cudaStreamNonBlocking));
+        }
         std::memcpy(frame_input_context.h_pinned_.get(), frame_input_context.raw_img.data,
                     frame_input_context.img_size);
         CHECK_CUDA(cudaMemcpyAsync(frame_input_context.d_raw_img_.get(),
                                    frame_input_context.h_pinned_.get(),
-                                   frame_input_context.img_size, cudaMemcpyHostToDevice));
+                                   frame_input_context.img_size, cudaMemcpyHostToDevice,
+                                   h2d_stream_));
+        // 推入队列前先等这 2.7MB 拷完：只等本流，不与推理流互相阻塞。
+        // 读帧线程每帧有 ~130ms 余量，等 ~1ms 无代价；换来的是模型侧无需跨流
+        // event 等待即可直接读到 GPU 上的当前帧。同步必须发生在 pinned 源复用之前，
+        // 也保证了下一帧 memcpy 覆写 pinned 缓冲时前一帧的 DMA 已收尾。
+        CHECK_CUDA(cudaStreamSynchronize(h2d_stream_));
     }
     // 更新下一帧的处理开始时间
     last_frame_start_time_ = std::chrono::steady_clock::now();

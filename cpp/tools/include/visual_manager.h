@@ -73,6 +73,17 @@ class DisplayManager {
     friend void onMouse(int event, int x, int y, int flags, void * userdata);
 };
 
+// 绘制一个跟踪目标所需的最小信息集。
+//
+// 抽出来的目的：DrawTarget 是纯 POD 数据——不含 STrack 的卡尔曼滤波状态、
+// 不做任何堆分配，因此可以安全地跨线程传递到「绘制/落盘工作线程」上执行。
+struct DrawTarget {
+    float      tlwh[4];  // left, top, width, height（原图坐标系）
+    int        class_id;
+    int        track_id;
+    cv::Scalar color;
+};
+
 class DrawingManager {
   public:
     // 传入追踪器引用（或者颜色列表）以及类别名称列表，以便画图时获取颜色和名字
@@ -80,9 +91,8 @@ class DrawingManager {
 
     // 核心绘制函数，画框、文字、以及特殊状态的红叉
     void drawTrackedObject(cv::Mat &            img,
-                           const STrack &       track,
-                           const AlertMessage & alert_msg,
-                           cv::Scalar           color_to_use);
+                           const DrawTarget &   target,
+                           const AlertMessage & alert_msg);
 
     // 绘制全局信息（FPS、帧数等）
     void drawGlobalInfo(cv::Mat & img, int num_frames, int show_fps, size_t num_tracks);

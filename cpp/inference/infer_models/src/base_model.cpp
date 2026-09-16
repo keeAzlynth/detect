@@ -59,10 +59,13 @@ std::unique_ptr<InferenceBackend> BaseModel::createBackend(
             auto trt_backend = std::make_unique<TensorRTBackend>(0);
             if (trt_backend->loadModel(it->second)) {
                 APP_INFO("TensorRT backend initialized successfully");
-                // 创建 CUDA 流
+                // 创建 CUDA 流（非阻塞）：不参与 legacy default stream 的隐式同步。
+                // 原先 cudaStreamCreate 出来的是 blocking stream，会与任何 legacy
+                // default stream 操作（例如不传 stream 的 cudaMemcpyAsync）互相插入
+                // 依赖，使 Depth/YOLO 的发射阶段被读帧线程的 H2D 顶到十几毫秒。
                 CHECK_CUDA(cudaSetDevice(0));
-                CHECK_CUDA(cudaStreamCreate(&stream_));
-                APP_INFO("CUDA stream created successfully");
+                CHECK_CUDA(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+                APP_INFO("CUDA stream created successfully (non-blocking)");
                 return trt_backend;
             }
         }

@@ -71,6 +71,16 @@ class IOManager {
     int                         save_interval_;             // 每 N 帧保存一张图（图片模式）
     int                         save_quality_;              // JPEG 压缩质量
     bool                        has_cuda_ = true;           // CUDA 可用性缓存（避免每帧查询）
+
+    // 专用的「非阻塞」H2D 拷贝流（仅读帧线程使用）。
+    //
+    // 为什么必须独立且非阻塞：此前 cudaMemcpyAsync 不传 stream，走的是 legacy
+    // default stream；而 Depth/YOLO 的推理流是 cudaStreamCreate 出来的 blocking
+    // stream。按 CUDA 语义，legacy default stream 上的操作会与所有 blocking 流
+    // 互相插入隐式依赖 —— 读帧线程每帧的 H2D 于是和主线程的 TRT enqueueV2 互相
+    // 串行，把 Depth/YOLO 的「发射」阶段顶到 12.8ms/8.2ms（实测，见 prof 输出）。
+    // 换成 cudaStreamNonBlocking 后，该流不再参与 legacy 同步，坑位彻底拆掉。
+    cudaStream_t                h2d_stream_ = nullptr;
 };
 
 struct SendObjectData {

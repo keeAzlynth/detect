@@ -5,6 +5,7 @@
 #include "depth_model.h"
 #include "frame.h"
 #include "motion_state_engine.h"
+#include "prof_stats.h"
 #include "public.h"
 #include "STrack.h"
 
@@ -106,6 +107,7 @@ void Pipeline::process(FrameInputContext &  frame_input_context,
 
     {
         PIPELINE_PHASE_SCOPE("Motion_State");
+        PROF_SCOPE("p6.motion_state");
         updateMotionStates(frame_input_context, infer_output_context);
     }
 
@@ -131,25 +133,30 @@ void Pipeline::processOverlap(FrameInputContext &  frame_input_context,
         depth_frame_counter_ = 0;
         {
             PIPELINE_PHASE_SCOPE("Depth_Inference_Async");
+            PROF_SCOPE("p1.depth_launch");
             depth_model_.runInferenceAsync(frame_input_context);
         }
     }
     {
         PIPELINE_PHASE_SCOPE("YOLO_Detection_Async");
+        PROF_SCOPE("p2.yolo_launch");
         detector_.runInferenceAsync(frame_input_context);
     }
     {
         PIPELINE_PHASE_SCOPE("YOLO_GetResult");
+        PROF_SCOPE("p3.yolo_wait");
         detector_.getInferOutputResult(infer_output_context);
     }
     {
         PIPELINE_PHASE_SCOPE("BYTETracker");
+        PROF_SCOPE("p4.tracker");
         updateTracker(infer_output_context);
     }
 
     if (run_depth) {
         {
             PIPELINE_PHASE_SCOPE("Depth_GetResult");
+            PROF_SCOPE("p5.depth_wait");
             depth_model_.getInferOutputResult(infer_output_context);
         }
         has_cached_depth_ = true;
@@ -161,6 +168,7 @@ void Pipeline::processOverlap(FrameInputContext &  frame_input_context,
 
     {
         PIPELINE_PHASE_SCOPE("Motion_State");
+        PROF_SCOPE("p6.motion_state");
         updateMotionStates(frame_input_context, infer_output_context);
     }
 
